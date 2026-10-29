@@ -158,6 +158,14 @@ func (h *TaskHandler) UpdateTask(
 		http.Error(w, "任务不存在", http.StatusNotFound)
 		return
 	}
+	if errors.Is(err, service.ErrInvalidStatus) {
+		http.Error(w, "无效的状态值", http.StatusBadRequest)
+		return
+	}
+	if errors.Is(err, service.ErrInvalidTitle) {
+		http.Error(w, "无效的标题", http.StatusBadRequest)
+		return
+	}
 	if err != nil {
 		log.Printf("更新任务失败：id=%d，错误=%v", idInt, err)
 		http.Error(w, "服务器内部错误", http.StatusInternalServerError)
@@ -165,7 +173,7 @@ func (h *TaskHandler) UpdateTask(
 	}
 	
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(http.StatusCreated)
+	w.WriteHeader(http.StatusOK)
 
 	if err := json.NewEncoder(w).Encode(task); err != nil {
 		log.Printf("编码新任务响应失败: %v", err)

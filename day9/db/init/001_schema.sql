@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS tasks (
         CHECK (length(btrim(title)) > 0), -- 不能为空字符串
 
     CONSTRAINT task_status_valid
-        CHECK (status IN ('pending', 'in_progress', 'completed')) -- 只能是三种状态之一
+        CHECK (status IN ('pending', 'in_progress', 'completed')), -- 只能是三种状态之一
 
     CONSTRAINT task_priority_valid
         CHECK (priority >= 1 AND priority <= 5) -- 优先级范围为1-5    

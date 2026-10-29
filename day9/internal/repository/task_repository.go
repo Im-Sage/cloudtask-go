@@ -157,13 +157,14 @@ func (r *TaskRepository) UpdateTask(
 		&task.UpdatedAt,
 	)
 
+	if errors.Is(err, pgx.ErrNoRows) {
+		return model.Task{}, fmt.Errorf("任务 %d: %w", id, ErrTaskNotFound)
+	}
+
 	if err != nil {
 		return model.Task{}, err
 	}
 
-	if errors.Is(err, pgx.ErrNoRows) {
-		return model.Task{}, fmt.Errorf("任务 %d: %w", id, ErrTaskNotFound)
-	}
 	return task, err
 }
 
