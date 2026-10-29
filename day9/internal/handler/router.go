@@ -1,26 +1,30 @@
 package handler
 
 import (
-	"net/http"
-
 	"example.com/cloudtask-go/day9/internal/service"
+	"github.com/gin-gonic/gin"
 )
 
 // 注册Http 路由
 
-func NewRouter(taskService *service.TaskService) http.Handler {
+func NewRouter(taskService *service.TaskService) *gin.Engine {
+	router := gin.Default()
 	taskHandler := NewTaskHandler(taskService)
-	mux := http.NewServeMux()
 
-	mux.HandleFunc("GET /tasks/{id}", taskHandler.GetTaskByID)
+	router.POST("/tasks",taskHandler.CreateTask)
 
-	mux.HandleFunc("GET /tasks", taskHandler.GetAllTasks)
+	router.GET("/tasks/:id",taskHandler.GetTaskByID)
 
-	mux.HandleFunc("POST /tasks", taskHandler.CreateTask)
+	// router.GET("/tasks?limit=3&offset=0",taskHandler.GetAllTasks)
 
-	mux.HandleFunc("DELETE /tasks/{id}", taskHandler.DeleteTask)
+	router.GET("/tasks",taskHandler.GetAllTasks)
 
-	mux.HandleFunc("PUT /tasks/{id}", taskHandler.UpdateTask)
+	router.DELETE("/tasks/:id", taskHandler.DeleteTask)
 
-	return mux
+	router.PUT("/tasks/:id",taskHandler.UpdateTask)
+
+
+	// router.GET("/tasks?limit=3&offset=0", taskHandler)
+
+	return router
 }

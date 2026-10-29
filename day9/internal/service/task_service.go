@@ -41,8 +41,12 @@ func (s *TaskService) GetTaskByID(
 	return s.taskRepository.GetTaskByID(ctx, id)
 }
 
-func (s *TaskService) GetAllTasks(ctx context.Context) ([]model.Task, error) {
-	return s.taskRepository.GetAllTasks(ctx)
+func (s *TaskService) GetAllTasks(
+	ctx context.Context,
+	limit int,
+	offset int,
+	status string) ([]model.Task, error) {
+	return s.taskRepository.GetAllTasks(ctx, limit, offset, status)
 }
 
 func (s *TaskService) DeleteTask(ctx context.Context, id int64) error {

@@ -1,6 +1,6 @@
 package requestbody
 
 type CreateTaskRequest struct {
-	Title       string `json:"title"`
-	Description string `json:"description"`
+	Title       string `json:"title" binding:"required,max=200"`
+	Description string `json:"description" binding:"required"`
 }

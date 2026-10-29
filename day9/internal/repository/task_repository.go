@@ -89,6 +89,9 @@ func (r *TaskRepository) GetTaskByID(
 // 查询多条记录
 func (r *TaskRepository) GetAllTasks(
 	ctx context.Context,
+	limit int,
+	offset int,
+	status string,
 ) ([]model.Task, error) {
 	// 返回的是一个装有任务的数组
 	tasks := []model.Task{}
@@ -96,9 +99,13 @@ func (r *TaskRepository) GetAllTasks(
 	rows, err := r.pool.Query(
 		ctx,
 		`select id, title,description,status,created_at,updated_at
-		from tasks
+		from tasks where status = $1
 		order by id desc
+		limit $2 OFFSET $3;
 		`,
+		status,
+		limit,
+		offset,
 	)
 	if err != nil {
 		return nil, err
