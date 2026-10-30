@@ -21,6 +21,7 @@ func NewTaskService(taskRepository *repository.TaskRepository) *TaskService {
 
 var ErrInvalidTitle = errors.New("invalid title")
 var ErrInvalidDescription = errors.New("invalid description")
+var ErrTaskNotFound = errors.New("TaskNotFound")
 var ErrInvalidStatus = errors.New("invalid status (should be 'pending' or 'in_progress' or 'completed')")
 
 func (s *TaskService) CreateTask(
@@ -65,4 +66,11 @@ func (s *TaskService) UpdateTask(
 		return model.Task{}, ErrInvalidTitle
 	}
 	return s.taskRepository.UpdateTask(ctx, id, title, status)
+}
+
+func (s *TaskService) ChangeStatus(ctx context.Context, id int64, newStatus string) error {
+	if newStatus != "pending" && newStatus != "in_progress" && newStatus != "completed" {
+		return ErrInvalidStatus
+	}
+	return s.taskRepository.ChangeStatus(ctx, id, newStatus)
 }

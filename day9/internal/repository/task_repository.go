@@ -2,8 +2,10 @@ package repository
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 
 	"example.com/cloudtask-go/day9/internal/model"
 	"github.com/jackc/pgx/v5"
@@ -192,4 +194,69 @@ func (r *TaskRepository) DeleteTask(
 		return fmt.Errorf("任务 %d: %w", id, ErrTaskNotFound)
 	}
 	return nil
+}
+
+// 读取原状态 -> 更新任务状态 -> 插入时间 -> 提交事务
+func (r *TaskRepository) ChangeStatus(
+	ctx context.Context,
+	id int64,
+	newStatus string,
+) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) // 兜底回滚
+	// 1、读取旧状态
+	var oldStatus string
+
+	err = tx.QueryRow(ctx,
+		`select status from tasks where id = $1 for update`,
+		id).Scan(&oldStatus)
+	// 检查任务是否存在
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("任务 %d: %w", id, ErrTaskNotFound)
+	}
+	if oldStatus == newStatus {
+		log.Printf("任务状态未变化：id=%d,status=%s", id, oldStatus)
+		return tx.Commit(ctx)
+	}
+	if err != nil {
+		return fmt.Errorf("读取任务旧状态失败: %w", err)
+	}
+	// 使用tx.Exec
+	tag, err := tx.Exec(
+		ctx,
+		`update tasks set status = $1, updated_at = CURRENT_TIMESTAMP where id = $2`,
+		newStatus, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrTaskNotFound
+	}
+	// 使用tx.Exec 插入 task_event;
+	// var task_event model.TaskEvent
+	// task_event.TaskID = id
+	event_type := "status_changed"
+	details, err := json.Marshal(map[string]string{
+		"old_status": oldStatus,
+		"new_status": newStatus,
+	})
+	if err != nil {
+		return err
+	}
+
+	tag, err = tx.Exec(
+		ctx,
+		`insert into task_events (task_id, event_type, details) values ($1,$2,$3)`,
+		id, event_type, details,
+	)
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("插入事件任务%d失败", id)
+	}
+	if err != nil {
+		return fmt.Errorf("插入事件失败：%w", err)
+	}
+	return tx.Commit(ctx)
 }

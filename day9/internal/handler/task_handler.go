@@ -155,12 +155,7 @@ func (h *TaskHandler) DeleteTask(
 ) {
 	idStr := c.Param("id")
 	idInt, err := strconv.ParseInt(idStr, 10, 64)
-	if idInt <= 0 {
-		writeError(c, http.StatusBadRequest, "INVALID_ID", "任务 ID 必须是正整数")
-		// http.Error(w, "Invalid ID", http.StatusBadRequest)
-		return
-	}
-	if err != nil {
+	if idInt <= 0 || err != nil {
 		writeError(c, http.StatusBadRequest, "INVALID_ID", "任务 ID 必须是正整数")
 		// http.Error(w, "Invalid ID", http.StatusBadRequest)
 		return
@@ -199,12 +194,7 @@ func (h *TaskHandler) UpdateTask(
 
 	idStr := c.Param("id")
 	idInt, err := strconv.ParseInt(idStr, 10, 64)
-	if idInt <= 0 {
-		writeError(c, http.StatusBadRequest, "INVALID_ID", "任务 ID 必须是正整数")
-		// http.Error(w, "Invalid ID", http.StatusBadRequest)
-		return
-	}
-	if err != nil {
+	if idInt <= 0 || err != nil {
 		writeError(c, http.StatusBadRequest, "INVALID_ID", "任务 ID 必须是正整数")
 		// http.Error(w, "Invalid ID", http.StatusBadRequest)
 		return
@@ -240,4 +230,40 @@ func (h *TaskHandler) UpdateTask(
 	// if err := json.NewEncoder(w).Encode(task); err != nil {
 	// 	log.Printf("编码新任务响应失败: %v", err)
 	// }
+}
+
+func (s *TaskHandler) ChangeStatus(c *gin.Context) {
+	// 接收路径参数
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil || id <= 0 {
+		writeError(c, http.StatusBadRequest, "INVALID_ID", "任务 ID 必须是正整数")
+		return
+	}
+	// 获取status
+	var req requestbody.ChangeStatusRequest
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "INVALID_REQUEST", "请求参数有问题")
+		return
+	}
+	newStatus := req.Status
+	err = s.taskService.ChangeStatus(c.Request.Context(), id, newStatus)
+
+	if errors.Is(err, service.ErrInvalidStatus) {
+		writeError(c, http.StatusBadRequest, "INVALID_STATUS", "无效的状态值")
+		// http.Error(w, "无效的状态值", http.StatusBadRequest)
+		return
+	}
+
+	if errors.Is(err, repository.ErrTaskNotFound) {
+		writeError(c, http.StatusBadRequest, "NOT FOUND TASK","找不到任务")
+	}
+
+	if err != nil {
+		log.Printf("更新任务失败：id=%d，错误=%v", id, err)
+		writeError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "内部错误")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "更新成功"})
 }
