@@ -77,3 +77,31 @@
 | 认为 `main` 的 5 秒超时作用于请求                 | 不同操作使用了不同的 Context                                 | 在 Handler 中基于请求 Context 设置超时，并向下传递     |
 
 另外，失败事件插入即使被回滚，也可能消耗一个自增 ID。**事件 ID 出现间隔不代表有记录残留，更不能用来判断是否发生部分更新。**
+
+
+
+
+
+**此外在ChangedStatus-repository中，我使用的是**
+
+```go
+defer tx.Rollback(ctx)
+```
+
+**其中复用的是HTTP的ctx，如果http请求取消或者超时而失效，则回滚调用也可能无法正常执行。**
+
+改为
+
+```go
+defer func() {
+    rollbackCtx, cancel := context.WithTimeout(
+        context.Background(),
+        3*time.Second,
+    )
+    defer cancel()
+
+    _ = tx.Rollback(rollbackCtx)
+}()
+```
+
+为事务清理提供独立的时间预算。

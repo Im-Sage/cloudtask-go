@@ -257,7 +257,8 @@ func (s *TaskHandler) ChangeStatus(c *gin.Context) {
 	}
 
 	if errors.Is(err, repository.ErrTaskNotFound) {
-		writeError(c, http.StatusBadRequest, "NOT FOUND TASK","找不到任务")
+		writeError(c, http.StatusNotFound, "TASK_NOT_FOUND","找不到任务")
+		return
 	}
 
 	if err != nil {

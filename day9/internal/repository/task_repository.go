@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"time"
 
 	"example.com/cloudtask-go/day9/internal/model"
 	"github.com/jackc/pgx/v5"
@@ -141,10 +142,30 @@ func (r *TaskRepository) UpdateTask(
 	title string,
 	status string,
 ) (model.Task, error) {
+	// 先获取旧状态，如果新状态不同旧状态，就更新title、status、updated_at,同时向task_events中写入事件。
+	// 若新旧状态相同时，则只更新title、updated_at，同时写入事件。
+
+	// 引进事务
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return model.Task{}, err
+	}
+	// 回滚兜底
+	defer func() {
+		rollbackCtx, cancle := context.WithTimeout(
+			context.Background(),
+			3*time.Second,
+		)
+		defer cancle()
+		_ = tx.Rollback(rollbackCtx)
+	}()
+
+	// 先不获取之前的状态
+
 	// 设置一个Task放改好的任务
 	var task model.Task
 
-	err := r.pool.QueryRow(ctx,
+	err = tx.QueryRow(ctx,
 		`
 		UPDATE tasks
 	SET title = $1,
@@ -174,7 +195,21 @@ func (r *TaskRepository) UpdateTask(
 		return model.Task{}, err
 	}
 
-	return task, err
+	// 同时向task_events表内插入数据，事件类型为task_updated
+	event_type := "task_updated"
+	tag, err := tx.Exec(ctx,
+		`Insert into task_events (task_id, event_type) values($1, $2)`,
+		id, event_type)
+	if err != nil {
+		return model.Task{}, err
+	}
+	if tag.RowsAffected() == 0 {
+		return model.Task{}, fmt.Errorf("插入事件任务%d失败", id)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return model.Task{}, fmt.Errorf("提交任务更新事务失败%w", err)
+	}
+	return task, nil
 }
 
 // 删除任务
@@ -206,7 +241,15 @@ func (r *TaskRepository) ChangeStatus(
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx) // 兜底回滚
+	// defer tx.Rollback(ctx) // 兜底回滚
+	defer func() {
+		rollbackCtx, cancel := context.WithTimeout(
+			context.Background(),
+			3*time.Second,
+		)
+		defer cancel()
+		_ = tx.Rollback(rollbackCtx)
+	}()
 	// 1、读取旧状态
 	var oldStatus string
 
@@ -252,11 +295,11 @@ func (r *TaskRepository) ChangeStatus(
 		`insert into task_events (task_id, event_type, details) values ($1,$2,$3)`,
 		id, event_type, details,
 	)
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("插入事件任务%d失败", id)
-	}
 	if err != nil {
 		return fmt.Errorf("插入事件失败：%w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("插入事件任务%d失败", id)
 	}
 	return tx.Commit(ctx)
 }
