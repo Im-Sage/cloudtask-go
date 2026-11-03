@@ -25,6 +25,8 @@ func NewRouter(taskService *service.TaskService) *gin.Engine {
 
 	router.PATCH("/tasks/:id",taskHandler.ChangeStatus)
 
+	router.PATCH("tasks/opm/:id", taskHandler.ChangeStatusOptimistis)
+
 	// router.GET("/tasks?limit=3&offset=0", taskHandler)
 
 	return router

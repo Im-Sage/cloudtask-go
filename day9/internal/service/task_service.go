@@ -74,3 +74,11 @@ func (s *TaskService) ChangeStatus(ctx context.Context, id int64, newStatus stri
 	}
 	return s.taskRepository.ChangeStatus(ctx, id, newStatus)
 }
+
+
+func (s *TaskService) ChangeStatusOptimistis(ctx context.Context, id int64, newStatus string, expectedVersion int64) (model.Task, error) {
+	if newStatus != "pending" && newStatus != "in_progress" && newStatus != "completed" {
+		return model.Task{}, ErrInvalidStatus
+	}
+	return s.taskRepository.ChangeStatusOptimistis(ctx, id, newStatus,expectedVersion)
+}

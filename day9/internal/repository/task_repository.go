@@ -25,6 +25,7 @@ func NewTaskRepository(pool *pgxpool.Pool) *TaskRepository {
 }
 
 var ErrTaskNotFound = errors.New("task not found")
+var ErrVersionConflict = errors.New("task version conflct")
 
 // 创建任务
 func (r *TaskRepository) CreateTask(
@@ -40,7 +41,7 @@ func (r *TaskRepository) CreateTask(
 		`
 		INSERT INTO tasks (title, description)
         VALUES ($1, $2)
-        RETURNING id, title, description, status, created_at, updated_at
+        RETURNING id, title, description, status, created_at, updated_at, version
 		`,
 		title,
 		description,
@@ -51,6 +52,7 @@ func (r *TaskRepository) CreateTask(
 		&task.Status,
 		&task.CreatedAt,
 		&task.UpdatedAt,
+		&task.Version,
 	)
 	if err != nil {
 		return model.Task{}, err
@@ -69,7 +71,7 @@ func (r *TaskRepository) GetTaskByID(
 	err := r.pool.QueryRow(
 		ctx,
 		`select 
-		id, title, description, status, created_at, updated_at
+		id, title, description, status, created_at, updated_at, version
 		from tasks where id = $1`,
 		id,
 	).Scan(
@@ -79,6 +81,7 @@ func (r *TaskRepository) GetTaskByID(
 		&task.Status,
 		&task.CreatedAt,
 		&task.UpdatedAt,
+		&task.Version,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return model.Task{}, fmt.Errorf("任务 %d: %w", id, ErrTaskNotFound)
@@ -101,7 +104,7 @@ func (r *TaskRepository) GetAllTasks(
 
 	rows, err := r.pool.Query(
 		ctx,
-		`select id, title,description,status,created_at,updated_at
+		`select id, title,description,status,created_at,updated_at,version
 		from tasks where status = $1
 		order by id desc
 		limit $2 OFFSET $3;
@@ -123,6 +126,7 @@ func (r *TaskRepository) GetAllTasks(
 			&task.Status,
 			&task.CreatedAt,
 			&task.UpdatedAt,
+			&task.Version,
 		); err != nil {
 			return nil, err
 		}
@@ -170,6 +174,7 @@ func (r *TaskRepository) UpdateTask(
 		UPDATE tasks
 	SET title = $1,
 		status = $2,
+		version = version + 1,
 		updated_at = CURRENT_TIMESTAMP
 	WHERE id = $3
 	RETURNING id, title, description, status,
@@ -270,7 +275,11 @@ func (r *TaskRepository) ChangeStatus(
 	// 使用tx.Exec
 	tag, err := tx.Exec(
 		ctx,
-		`update tasks set status = $1, updated_at = CURRENT_TIMESTAMP where id = $2`,
+		`update tasks 
+		set status = $1, 
+		version = version + 1,
+		updated_at = CURRENT_TIMESTAMP 
+		where id = $2`,
 		newStatus, id)
 	if err != nil {
 		return err
@@ -302,4 +311,105 @@ func (r *TaskRepository) ChangeStatus(
 		return fmt.Errorf("插入事件任务%d失败", id)
 	}
 	return tx.Commit(ctx)
+}
+
+func (r *TaskRepository) ChangeStatusOptimistis(
+	ctx context.Context,
+	id int64,
+	newStatus string,
+	expectedVersion int64,
+) (model.Task, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return model.Task{}, err
+	}
+	// 回滚兜底
+	defer func() {
+		rollbackCtx, cancel := context.WithTimeout(
+			context.Background(),
+			3*time.Second,
+		)
+		defer cancel()
+		_ = tx.Rollback(rollbackCtx)
+	}()
+
+	// 读取当前任务和版本号
+	var old_status string
+	var old_version int64
+	var task model.Task
+
+	err = tx.QueryRow(
+		ctx,
+		`SELECT status, version from tasks where id = $1`,
+		id,
+	).Scan(
+		&old_status,
+		&old_version,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return model.Task{}, fmt.Errorf("任务 %d: %w", id, ErrTaskNotFound)
+	}
+	if err != nil {
+		return model.Task{}, err
+	}
+
+	// 判断期待的版本号是否和oldversion一样
+	if old_version != expectedVersion {
+		return model.Task{}, fmt.Errorf("任务%d更新状态失败：%w", id, ErrVersionConflict)
+	} else {
+		// 一致则更新表中数据
+		err := tx.QueryRow(
+			ctx,
+			`UPDATE tasks
+			SET status = $1,
+				version = version + 1,
+				updated_at = CURRENT_TIMESTAMP
+			where id = $2 AND version = $3
+			RETURNING id, title, description, status, created_at, updated_at, version
+				`,
+			newStatus,
+			id,
+			expectedVersion,
+		).Scan(
+			&task.ID,
+			&task.Title,
+			&task.Description,
+			&task.Status,
+			&task.CreatedAt,
+			&task.UpdatedAt,
+			&task.Version,
+		)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return model.Task{}, fmt.Errorf("任务 %d: %w", id, ErrVersionConflict)
+		}
+		if err != nil {
+			return model.Task{}, err
+		}
+		// 同时向事件表中插入数据
+		event_type := "status_changed"
+		details, err := json.Marshal(map[string]string{
+			"old_status": old_status,
+			"new_status": newStatus,
+		})
+		if err != nil {
+			return model.Task{}, err
+		}
+		tag, err := tx.Exec(
+			ctx,
+			`insert into task_events (task_id, event_type, details) values ($1,$2,$3)`,
+			id, event_type, details,
+		)
+		if err != nil {
+			return model.Task{}, fmt.Errorf("插入事件失败：%w", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return model.Task{}, fmt.Errorf("插入事件任务%d失败", id)
+		}
+
+		if err := tx.Commit(ctx); err != nil {
+			return model.Task{}, err
+		}
+
+		return task, nil
+	}
 }

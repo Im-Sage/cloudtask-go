@@ -6,5 +6,6 @@ type CreateTaskRequest struct {
 }
 
 type ChangeStatusRequest struct {
-	Status string `json:"status"`
+	Status  string `json:"status"`
+	ExpectedVersion int64  `json:"expected_version" binding:"required,gt=0"`
 }

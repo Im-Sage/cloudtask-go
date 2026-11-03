@@ -4,6 +4,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     description TEXT NOT NULL DEFAULT '', 
     status VARCHAR(20) NOT NULL DEFAULT 'pending',
     priority smallint NOT NULL DEFAULT 3, -- 优先级，越大越优先
+    version BIGINT NOT NULL DEFAULT 1,  -- 乐观锁版本号
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
