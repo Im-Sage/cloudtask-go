@@ -178,7 +178,7 @@ func (r *TaskRepository) UpdateTask(
 		updated_at = CURRENT_TIMESTAMP
 	WHERE id = $3
 	RETURNING id, title, description, status,
-			created_at, updated_at;
+			created_at, updated_at, version;
 	`,
 		title,
 		status,
@@ -190,6 +190,7 @@ func (r *TaskRepository) UpdateTask(
 		&task.Status,
 		&task.CreatedAt,
 		&task.UpdatedAt,
+		&task.Version,
 	)
 
 	if errors.Is(err, pgx.ErrNoRows) {

@@ -65,6 +65,18 @@ func (c *TaskCache) SetTask(ctx context.Context, id int64, task model.Task) erro
 	return nil
 }
 
+// 从cache中删除数据
+func (c *TaskCache) DeleteTask(ctx context.Context, id int64) error {
+	// 先判断目标记录是否在cache中
+	key := taskKey(int(id))
+	// 删除cache中数据
+	if err := c.client.Del(ctx,key).Err(); err != nil{
+		log.Printf("删除缓存失败：%v",err)
+		return err
+	}
+	return nil
+}
+
 func fun1() {
 	// 当前从 day9/internal/cache 目录运行，向上两级找到 .env
 	if err := godotenv.Load("../../.env"); err != nil {

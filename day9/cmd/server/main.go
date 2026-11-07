@@ -32,7 +32,7 @@ func main() {
 
 	pgCtx, pgCancel := context.WithTimeout(
 		ctx,
-		5 * time.Second)	
+		5*time.Second)
 	defer pgCancel()
 	pool, err := database.NewDBPool(pgCtx, dsn) // 先把连接池初始化好
 	if err != nil {
@@ -40,7 +40,7 @@ func main() {
 	}
 
 	defer pool.Close() // 连接池成功创建，关闭应该由调用方负责
-	
+
 	// 初始化redis连接
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     "127.0.0.1:6379",
@@ -52,17 +52,16 @@ func main() {
 
 	redisCtx, redisCancel := context.WithTimeout(
 		ctx,
-		5 * time.Second)	
+		5*time.Second)
 	defer redisCancel()
 
 	err = rdb.Ping(redisCtx).Err()
 	if err != nil {
-		fmt.Println("Redis 连接失败", err)
-		return 
+		log.Printf("Redis 暂不可用，继续启动服务：%v", err)
 	}
 
 	taskRepository := repository.NewTaskRepository(pool)
-	
+
 	taskCache := cache.NewTaskCache(rdb)
 
 	taskService := service.NewTaskService(taskRepository, taskCache)

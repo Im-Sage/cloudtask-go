@@ -52,16 +52,12 @@ func (s *TaskService) GetTaskByID(
 	if s.taskCache != nil {
 		log.Printf("启用了缓存")
 		task, hit, err := s.taskCache.GetTask(ctx, id)
-		if err == nil && hit {
-			log.Printf("任务缓存命中：id=%d", id)
-			// 命中则直接返回
-			return task, nil
-		}
-		if !hit {
-			log.Printf("读取缓存失败，准备回源：id=%d", id)
-		}
-		if err != nil {
-			return model.Task{}, err
+		if err != nil{
+			// redis连接对象存在，但本次缓存操作失败
+			log.Printf("连接对象存在，但本次操作失败,原因：%v, 准备回源",err)
+		}else if hit {
+			// 命中直接返回
+			return task,nil
 		}
 	}
 	// 未命中则准备开始回源
@@ -102,7 +98,20 @@ func (s *TaskService) UpdateTask(
 	if strings.TrimSpace(title) == "" {
 		return model.Task{}, ErrInvalidTitle
 	}
-	return s.taskRepository.UpdateTask(ctx, id, title, status)
+	// 先写数据库，成功后删除缓存，让下一次读取重新从数据库加载。
+	task, err := s.taskRepository.UpdateTask(ctx, id, title, status)
+	// 数据库更新失败直接返回错误，不删除缓存
+	if err != nil {
+		return model.Task{}, err
+	}
+	// 数据库更新成功则删除当前缓存，首先要判断是否开启了缓存
+	if s.taskCache != nil {
+		if err := s.taskCache.DeleteTask(ctx, id); err != nil {
+			// 若数据库删除失败不影响数据库更新操作
+			log.Printf("删除缓存失败：%v", err)
+		}
+	}
+	return task, nil
 }
 
 func (s *TaskService) ChangeStatus(ctx context.Context, id int64, newStatus string) error {
