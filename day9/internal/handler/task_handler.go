@@ -8,9 +8,9 @@ import (
 	"slices"
 	"strconv"
 
-	"example.com/cloudtask-go/day9/internal/repository"
-	"example.com/cloudtask-go/day9/internal/requestbody"
-	"example.com/cloudtask-go/day9/internal/service"
+	"github.com/Im-Sage/cloudtask-go/day9/internal/repository"
+	"github.com/Im-Sage/cloudtask-go/day9/internal/requestbody"
+	"github.com/Im-Sage/cloudtask-go/day9/internal/service"
 	"github.com/gin-gonic/gin"
 	// "golang.org/x/tools/go/analysis/passes/nilfunc"
 )
@@ -286,7 +286,7 @@ func (s *TaskHandler) ChangeStatusOptimistis(c *gin.Context) {
 	}
 	newStatus := req.Status
 	expectedVersion := req.ExpectedVersion
-	task,err := s.taskService.ChangeStatusOptimistis(
+	task, err := s.taskService.ChangeStatusOptimistis(
 		c.Request.Context(),
 		id, newStatus,
 		expectedVersion,
@@ -315,6 +315,6 @@ func (s *TaskHandler) ChangeStatusOptimistis(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"message": "更新成功",
-		"data": task,	
+		"data":    task,
 	})
 }

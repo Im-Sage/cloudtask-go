@@ -8,7 +8,7 @@ import (
 	"log"
 	"time"
 
-	"example.com/cloudtask-go/day9/internal/model"
+	"github.com/Im-Sage/cloudtask-go/day9/internal/model"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )

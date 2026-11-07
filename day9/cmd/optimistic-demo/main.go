@@ -18,6 +18,7 @@ type Result struct {
 }
 
 func main() {
+
 	const taskID int64 = 20015 // 替换成测试任务 ID
 
 	url := fmt.Sprintf(
