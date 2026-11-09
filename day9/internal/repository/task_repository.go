@@ -237,6 +237,32 @@ func (r *TaskRepository) DeleteTask(
 	return nil
 }
 
+// 数据量不大的情况下，获取所有的id，为布隆过滤器做准备
+func (r *TaskRepository) GetIds(ctx context.Context) ([]int64, error){
+	var ids []int64
+
+	rows, err := r.pool.Query(
+		ctx,
+		`select id from tasks order by id;`,
+	)
+	if err != nil {
+		return ids, err
+	}
+	defer rows.Close() // 关闭结果集，释放连接
+
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(
+			&id,
+		); err != nil{
+			return ids, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+
 // 读取原状态 -> 更新任务状态 -> 插入时间 -> 提交事务
 func (r *TaskRepository) ChangeStatus(
 	ctx context.Context,
@@ -414,3 +440,5 @@ func (r *TaskRepository) ChangeStatusOptimistis(
 		return task, nil
 	}
 }
+
+

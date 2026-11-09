@@ -15,6 +15,8 @@ import (
 	"github.com/Im-Sage/cloudtask-go/day9/internal/service"
 	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
+
+	"github.com/google/uuid"
 )
 
 // 初始化连接池、配置路由、启动HTTP服务
@@ -61,10 +63,22 @@ func main() {
 	}
 
 	taskRepository := repository.NewTaskRepository(pool)
+	
+	bloomKey := "cloudtask:task:bloom:build:" + uuid.NewString()
+	log.Printf("本次布隆过滤器 key：%s", bloomKey)
+	taskBloom := cache.NewTaskBloom(rdb, bloomKey)
+	ids, err := taskRepository.GetIds(ctx)
+	if err == nil {
+		err = taskBloom.Build(ctx, ids)
+	}
+	if err != nil {
+		log.Printf("构建过滤器失败：禁用否定拦截：%v", err)
+		taskBloom = nil
+	}
 
 	taskCache := cache.NewTaskCache(rdb)
 
-	taskService := service.NewTaskService(taskRepository, taskCache)
+	taskService := service.NewTaskService(taskRepository, taskCache, taskBloom)
 
 	router := handler.NewRouter(taskService)
 

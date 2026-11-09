@@ -23,7 +23,10 @@ services:
     command:
       - sh
       - -c
-      - 'exec redis-server --requirepass "$$REDIS_PASSWORD"'
+      - |
+        exec redis-server \
+          --requirepass "$$REDIS_PASSWORD" \
+          --loadmodule /usr/local/lib/redis/modules/redisbloom.so
     healthcheck:
       test:
         - CMD-SHELL

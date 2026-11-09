@@ -26,38 +26,78 @@ func NewTaskCache(client *redis.Client) *TaskCache {
 	}
 }
 
+// Redis 中保存的JSON格式
+type taskCacheEntry struct {
+	Exists bool        `json:"exists"`
+	Task   *model.Task `json:"task,omitempty"`
+}
+
+// 返回给Service的缓存查询结果
+type TaskCacheResult struct {
+	Hit    bool
+	Exists bool
+	Task   model.Task
+}
+
 func taskKey(id int) string {
 	return fmt.Sprintf("cloudtask:task:%d:v1", id)
 }
 
+func taskKey2(id int) string {
+	return fmt.Sprintf("cloudtask:task:%d:v2", id)
+}
+
 // 从cache中读取task
-func (c *TaskCache) GetTask(ctx context.Context, id int64) (model.Task, bool, error) {
-	key := taskKey(int(id))
+func (c *TaskCache) GetResult(ctx context.Context, id int64) (TaskCacheResult, error) {
+	key := taskKey2(int(id))
 	data, err := c.client.Get(ctx, key).Bytes()
 	if errors.Is(err, ErrCacheMiss) {
-		return model.Task{}, false, nil
+		return TaskCacheResult{
+			Hit:    false,
+			Exists: false,
+			Task:   model.Task{},
+		}, nil
 	}
 	if err != nil {
 		log.Printf("发生错误：%v", err)
-		return model.Task{}, false, err
+		return TaskCacheResult{
+			Hit:    false,
+			Exists: false,
+			Task:   model.Task{},
+		}, err
 	}
-	var task model.Task
-	if err := json.Unmarshal(data, &task); err != nil {
+	var entry taskCacheEntry
+	if err := json.Unmarshal(data, &entry); err != nil {
 		log.Printf("反序列化失败：%v", err)
-		return model.Task{}, false, err
+		return TaskCacheResult{
+			Hit:    false,
+			Exists: false,
+			Task:   model.Task{},
+		}, err
 	}
-	return task, true, nil
+	if entry.Task == nil || entry.Task.ID != id {
+		return TaskCacheResult{}, fmt.Errorf("任务缓存内容无效：id=%d", id)
+	}
+	return TaskCacheResult{
+		Hit:    true,
+		Exists: true,
+		Task:   *entry.Task,
+	}, err
 }
 
 // 向cache中写入task
-func (c *TaskCache) SetTask(ctx context.Context, id int64, task model.Task) error {
-	// 首先将task序列化为json
-	data, err := json.Marshal(task)
+func (c *TaskCache) SetEntry(ctx context.Context, id int64, task model.Task) error {
+	// 装填Entry
+	var taskEntry taskCacheEntry
+	taskEntry.Exists = true
+	taskEntry.Task = &task
+	// 序列化为json
+	data, err := json.Marshal(taskEntry)
 	if err != nil {
-		fmt.Println("序列化json失败：%v", err)
+		log.Printf("序列化json失败：%v", err)
 		return err
 	}
-	key := taskKey(int(id))
+	key := taskKey2(int(id))
 	err = c.client.Set(ctx, key, data, 5*time.Minute).Err()
 	if err != nil {
 		return err
@@ -68,10 +108,26 @@ func (c *TaskCache) SetTask(ctx context.Context, id int64, task model.Task) erro
 // 从cache中删除数据
 func (c *TaskCache) DeleteTask(ctx context.Context, id int64) error {
 	// 先判断目标记录是否在cache中
-	key := taskKey(int(id))
+	key := taskKey2(int(id))
 	// 删除cache中数据
-	if err := c.client.Del(ctx,key).Err(); err != nil{
-		log.Printf("删除缓存失败：%v",err)
+	if err := c.client.Del(ctx, key).Err(); err != nil {
+		log.Printf("删除缓存失败：%v", err)
+		return err
+	}
+	return nil
+}
+
+func (c *TaskCache) SetNotFound(ctx context.Context, id int64) error {
+	var entry taskCacheEntry
+	entry.Exists = false
+	entry.Task = nil
+	// 将entry转化为json
+	data, err := json.Marshal(entry)
+	if err != nil {
+		log.Printf("序列化json失败：%v", err)
+		return err
+	}
+	if err := c.client.Set(ctx, taskKey2(int(id)), data, 30*time.Second).Err(); err != nil {
 		return err
 	}
 	return nil
@@ -110,7 +166,7 @@ func fun1() {
 		Version:     1,
 	}
 
-	key := taskKey(id)
+	key := taskKey2(id)
 	fmt.Print(key)
 
 	data, err := json.Marshal(task)

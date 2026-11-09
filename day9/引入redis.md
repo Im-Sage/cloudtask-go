@@ -13,6 +13,10 @@
 7. Context 的父子关系与生命周期
 8. 常见报错与排查方式
 9. 验证方法与后续工作
+10. 更新后的缓存失效与一致性
+11. Redis 故障降级复盘
+12. VS Code 断点调试与工作目录
+13. 空值缓存：缓存穿透防护与修复复盘
 
 ## 1. 阶段目标与当前进度
 
@@ -35,14 +39,19 @@
 | Compose 添加 Redis、端口绑定、密码和健康检查 | 已配置 |
 | Go 加载 .env、初始化 Client 并注入 TaskCache | 已实现，注意工作目录 |
 | JSON 序列化、缓存读写、5 分钟 TTL | 已实现 |
-| 未命中返回 Task 零值、false、nil | 已实现 |
+| 未命中的结果表示 | 已升级为 TaskCacheResult，Hit=false、err=nil |
 | 命中直接返回，未命中查询 PostgreSQL | 已实现 |
 | 数据库错误正常返回 | 已实现 |
 | 缓存回填失败只记录日志 | 已实现 |
 | Service 用 nil 判断是否启用缓存 | 已实现 |
-| Redis 读取异常时继续查询数据库 | 待完善：当前仍直接返回错误 |
-| Redis 不可用时允许 HTTP 服务启动 | 待完善：main 中 Ping 失败仍退出 |
-| 修改、删除任务后使缓存失效 | 待完善 |
+| Redis 读取异常时继续查询数据库 | 已调整为记录日志后回源，需故障验证 |
+| Redis 不可用时允许 HTTP 服务启动 | 已调整为 Ping 失败只记录日志，需故障验证 |
+| UpdateTask 成功后删除详情缓存 | 已实现，删除失败仅记录日志 |
+| DeleteTask、状态修改后的缓存失效 | 待完善 |
+| 提交后使用独立、有界的缓存失效上下文 | 待完善：当前仍使用请求 ctx |
+| 正常任务与空值缓存使用包装 JSON，key 升级 v2 | 已实现 |
+| Service 区分空值命中，并保留数据库未找到错误 | 已实现 |
+| 空值缓存有效命中、阻止重复回源 | 尚缺 GetResult 的 Exists=false 返回分支，见第 13 节 |
 
 ## 2. Docker Compose 配置、网络与认证
 
@@ -285,6 +294,8 @@ module github.com/Im-Sage/cloudtask-go
 
 ## 5. Key、JSON、TTL 与缓存读写
 
+本节的裸 Task JSON、v1 key 和 GetTask 三返回值示例记录引入空值缓存前的设计。当前已升级为 v2 包装格式和 GetResult，最新设计与剩余问题见第 13 节，不应将两种格式混写到同一个 key。
+
 ### 5.1 Key 设计
 
 建议统一使用模型和查询使用的 int64：
@@ -361,6 +372,8 @@ Service 应通过 err 判断，Handler 按项目错误约定映射 HTTP 状态�
 
 ## 6. Service 中的缓存编排
 
+本节示例是尚未引入空值缓存时的流程。加入空值缓存后，命中还需判断 Exists，数据库未找到需尝试写入短期空值并保留未找到错误，详见第 13 节。
+
 下面是满足本阶段四项 TODO 的建议流程，不代表当前源码已经完全实现：
 
 ```go
@@ -397,11 +410,11 @@ func (s *TaskService) GetTaskByID(ctx context.Context, id int64) (model.Task, er
 }
 ```
 
-此处缓存读取错误只记录日志，不直接返回。当前实际代码仍保留了 `if err != nil { return model.Task{}, err }`，需要调整后才支持 Redis 异常回源。
+此处缓存读取错误只记录日志，不直接返回。早期实际代码保留了 `if err != nil { return model.Task{}, err }`，因此 Redis 离线时返回 500；最新源码已经去掉这个提前返回，支持继续查询 PostgreSQL。源码路径已调整，实际故障验证见第 11 节。
 
 上述降级以请求本身仍然有效为前提。如果请求 ctx 已经超时或取消，用同一个 ctx 查询数据库也会失败。后续可以为缓存分配较短的子上下文，同时保留原始请求上下文用于数据库查询。
 
-启动降级和运行时降级是两件事：main 中 Ping 失败就退出，会让 HTTP 服务无法启动；Service 能处理 nil 缓存，并不意味着入口已经提供了禁用缓存的配置开关。
+启动降级和运行时降级是两件事：早期 main 中 Ping 失败就退出，会让 HTTP 服务无法启动；最新源码已改为只记录日志并继续启动。Service 能处理 nil 缓存，并不意味着入口已经提供了禁用缓存的配置开关。
 
 ## 7. Context 的父子关系与生命周期
 
@@ -541,18 +554,426 @@ docker compose exec redis redis-cli --askpass DEL cloudtask:task:11:v1
 - 冷缓存：数据库有记录，首次查询成功并回填，后续命中。
 - 数据库无记录：返回项目约定的未找到结果，不缓存 Task 零值。
 - 缓存过期：重新查询数据库并回填。
-- Redis 读取故障：请求仍有效时应回源；当前源码尚未满足。
+- Redis 读取故障：最新源码已改为回源，需确认请求仍有效时实际返回数据库结果。
 - Redis 写入故障：已有数据库结果仍能返回。
 - 缓存关闭：传入 nil 后仍能查询；需在入口提供配置方式。
-- 启动时 Redis 不可用：按可选缓存策略继续启动；当前源码尚未满足。
-- 请求超时或取消：应终止相关操作，不能用 Background 绕过请求取消。
+- 启动时 Redis 不可用：最新源码已允许继续启动，需确认 HTTP 服务实际监听。
+- 请求超时或取消：普通查询应停止；已提交更新的缓存清理可使用独立、有界的上下文，见第 10 节。
 
 ### 9.4 后续改进
 
-1. 先补齐运行时降级与启动降级，再验证 Redis 不可用的行为。
-2. 更新、删除或修改任务状态成功后，删除对应详情缓存，避免旧数据一直保留到 TTL 到期。
+1. 对已调整的运行时降级与启动降级进行故障验证，记录状态码、数据和耗时。
+2. UpdateTask 已加入失效；继续补齐删除任务、普通状态修改和乐观锁状态修改的详情缓存失效。
 3. 统一 key 函数的 int64 ID 类型，整理遗留练习代码和错误日志。
 4. 为缓存操作设置合适的短超时与连接超时，避免故障缓存耗尽整个请求预算。
 5. 并发更新与回填可能再次写入旧值，简单删除缓存并不保证强一致；后续再根据实际需求研究版本校验等方案。
 
 本笔记整理了已有观察和源码状态，尚未执行上述完整故障验证。代码片段按用途分段展示，需要放入相应包并补齐导入。
+
+## 10. 更新后的缓存失效与一致性
+
+### 10.1 先提交数据库，再删除缓存
+
+更新采用“先写数据库、成功后删除缓存”的顺序，不要求更新时直接重写缓存；下一次查询未命中时再回源并回填。
+
+```text
+参数校验
+  → Repository 更新 PostgreSQL 并提交事务
+      → 失败：返回数据库错误，不执行正常缓存失效流程
+      → 成功：尝试删除详情缓存
+          → 删除失败：记录日志，仍返回数据库更新结果
+```
+
+最新 UpdateTask 已保留校验、检查 Repository 错误、判断 taskCache 非 nil，并在删除失败后返回数据库结果。Repository 在事务提交成功后才正常返回。
+
+注释应写成“Redis 缓存删除失败，不改变数据库已更新成功的事实”，而不是“数据库删除失败”。返回更新成功符合数据库的实际结果；返回错误不能撤销已经提交的事务。
+
+### 10.2 DEL 不需要提前 GET
+
+```go
+func (c *TaskCache) DeleteTask(ctx context.Context, id int64) error {
+    key := taskKey(int(id)) // 与当前 key 函数参数类型一致
+    return c.client.Del(ctx, key).Err()
+}
+```
+
+DEL 是幂等的：同一 key 删除多次，最终仍是不在缓存中。key 不存在时返回删除数量 0、错误 nil，不是删除失败。提前 GET 会增加一次请求，还可能把 redis.Nil 误报为异常，检查与删除之间也不是原子操作。
+
+最新 Cache.DeleteTask 已直接执行 DEL。当前 Cache 与 Service 都可能记录删除错误，后续可统一在 Service 记录，避免重复日志。
+
+### 10.3 提交后的独立、有界 Context
+
+问题场景：数据库已提交成功，客户端随即断开，请求 ctx 取消；如果删除缓存继续使用这个 ctx，清理操作可能立即失败。
+
+建议仅在数据库提交成功后创建独立上下文，并给出新的短期限：
+
+```go
+task, err := s.taskRepository.UpdateTask(ctx, id, title, status)
+if err != nil {
+    return model.Task{}, err
+}
+
+if s.taskCache != nil {
+    invalidateCtx, cancel := context.WithTimeout(
+        context.WithoutCancel(ctx),
+        2*time.Second,
+    )
+    defer cancel()
+
+    if err := s.taskCache.DeleteTask(invalidateCtx, id); err != nil {
+        log.Printf("提交后删除缓存失败：id=%d err=%v", id, err)
+    }
+}
+return task, nil
+```
+
+- 独立：WithoutCancel 保留上下文值，不继承原请求的取消信号与截止时间。
+- 有界：WithTimeout 设置自己的 2 秒期限，不允许无期限清理。
+- 也可从 Background 派生，但会丢失原请求上下文中的追踪信息。
+- 独立不等于异步，上例仍会等待删除返回；实际网络行为需要客户端配合。
+- 不能保证成功：Redis 故障、进程崩溃等仍可能让缓存残留。
+
+此示例是建议，当前 UpdateTask 仍使用传入的请求 ctx。若确认提交前取消且事务回滚，则无需执行正常的提交后缓存失效。若 COMMIT 时连接中断或取消，提交结果可能不确定，不能把所有提交错误都解释成“数据库肯定没改”。
+
+### 10.4 删除失败为什么会不一致
+
+```text
+数据库标题 A → B，提交成功
+Redis 删除失败，保留 A
+后续读取命中 Redis，返回旧值 A
+```
+
+这是数据库与缓存之间的一致性问题，不是数据库数据丢失。PostgreSQL 的本地事务不能将 Redis 删除一起原子提交。
+
+| 措施 | 价值 | 局限 |
+|---|---|---|
+| 5 分钟 TTL | 残留副本最终过期 | 有效期内可能读到旧值，不保证所有并发场景严格 5 分钟内收敛 |
+| 独立、有界 Context | 减少请求取消导致的清理失败 | 无法解决 Redis 离线 |
+| 有限重试与日志 | 应对短暂故障，便于排查 | 进程崩溃可能丢失内存中的重试任务 |
+| Outbox 持久化失效任务 | 更新与“需要失效”的待办同事务保存，后台可恢复重试 | 增加实现复杂度，仍需处理并发回填 |
+
+另一种竞争条件即使 DEL 成功也会出现：
+
+```text
+请求 A：缓存未命中，从数据库读到旧值
+请求 B：更新数据库，删除缓存成功
+请求 A：把之前读到的旧值回填 Redis
+```
+
+所以“先更新数据库再删除缓存”是常用策略，不等于强一致保证。当前学习项目先落实 TTL、正确失效顺序、日志和降级；关键业务若要求立即读到新值，可让关键读取绕过缓存，并另行设计并发一致性机制。
+
+## 11. Redis 故障降级复盘
+
+### 11.1 对象存在不代表远端服务在线
+
+```text
+TaskService → TaskCache 对象 → Redis Client 对象 → 网络 → Redis 服务
+```
+
+`s.taskCache != nil` 只表示 Go 内存中提供了缓存对象，不是健康检查。关闭 Redis 容器不会把已有指针自动改成 nil。
+
+| 状态 | 含义 |
+|---|---|
+| taskCache 为 nil | 按项目约定未启用缓存 |
+| 对象非 nil，命令报错 | 本次缓存访问失败，可能离线、认证失败或超时 |
+| 命令成功，hit 为 false | 缓存正常，但没有目标数据 |
+| 命令成功，hit 为 true | 有可用缓存，可以直接返回 |
+
+保留 Client 后，Redis 恢复时后续命令可以再次尝试连接。对象不会因为一次操作失败自动消失。
+
+### 11.2 运行时降级：避免在缓存错误处提前返回
+
+实际观察：关闭 Redis 后查询存在的任务，接口返回 500，日志包含 `dial tcp 127.0.0.1:6379 ... actively refused it`。
+
+当时原因是 Service 在缓存读取错误处分支 return，根本没有执行 PostgreSQL 查询。打印“准备回源”不会改变控制流程。
+
+最新源码改为：读取失败只记录日志；只有“无错误且命中”提前返回，其余情况继续查询数据库。数据库查询成功后，回填失败仍仅记录日志。
+
+需要注意，读取和回填都可能发生连接重试；接口能够返回 200 不代表故障时延已经合适。后续应限制缓存操作预算，并避免反复访问已知故障依赖。
+
+### 11.3 启动降级：Ping 失败不一定要退出
+
+此前启动日志先显示 PostgreSQL 连接池创建成功，再报告 Redis 连接失败，程序退出。Go 程序实际上已运行，只是 main 的 Ping 错误分支执行 return，HTTP 监听尚未开始。
+
+最新源码已经改成：
+
+```go
+if err := rdb.Ping(redisCtx).Err(); err != nil {
+    log.Printf("Redis 暂不可用，继续启动服务：%v", err)
+}
+// 继续组装 Service 和启动 HTTP 服务。
+```
+
+| 故障时机 | 负责处理的位置 |
+|---|---|
+| HTTP 服务启动前 Redis 不可用 | main 允许继续启动 |
+| HTTP 服务运行中 Redis 不可用 | Service 回源并容忍回填失败 |
+| 数据库提交后删除缓存失败 | 返回数据库结果，记录失效失败并按策略补偿 |
+
+允许继续启动仍可能包含 Ping 的失败等待和重试。这里把 Redis 定义为可选缓存；若承担会话或必需业务状态，不能不加分析地使用相同策略。
+
+### 11.4 下一轮验证清单
+
+以下是待执行的检查，不是已通过的测试结果：
+
+1. 运行中关闭 Redis，查询 PostgreSQL 已有任务，确认 200 与正确数据，记录故障耗时。
+2. Redis 保持关闭，重新启动 Go 服务，确认 HTTP 端口实际开始监听。
+3. Redis 关闭时更新任务，确认数据库更新成功，不因缓存清理失败误报失败。
+4. 重新启动 Redis，确认客户端后续可以恢复访问；检查旧缓存是否残留。
+5. 预热详情缓存后更新任务，确认缓存被删除，下一次查询返回新值并回填。
+6. 更新不存在的任务，确认数据库错误正常返回，不走成功后的失效流程。
+7. 补齐其他写入入口的失效；单独验证请求取消与提交后清理的边界。
+
+本次只更新开发笔记，没有修改业务代码，也没有实际启停服务或更新数据库。
+
+## 12. VS Code 断点调试与工作目录
+
+### 12.1 现象与排查结论
+
+在 task_handler.go 的 GetTaskByID 中，对调用 Service 的语句设置断点后，按 F5 没有停住：
+
+```go
+task, err := h.taskService.GetTaskByID(c.Request.Context(), idInt)
+```
+
+需要分别确认“调试程序是否成功启动”和“请求是否执行到断点”。本次检查发现，原 launch.json 的 cwd 是 cloudtask-go，而 main 使用 `godotenv.Load("../../.env")`，工作目录与相对路径不匹配，可能导致加载失败并提前 return。
+
+当前 launch.json 已将 cwd 调整为 day9/cmd/server，与该加载路径匹配。但配置正确不代表已验证断点命中，仍需启动调试并发送请求。
+
+### 12.2 program 与 cwd 的区别
+
+| 配置 | 作用 |
+|---|---|
+| program | 指定要编译和调试的 Go 入口包目录 |
+| cwd | 指定被调试程序运行时的工作目录，决定相对文件路径如何解析 |
+| workspaceFolder | VS Code 当前打开的工作区文件夹路径 |
+
+源文件所在目录、入口包目录和运行工作目录可以不同。设置 program 不代表 cwd 自动与之相同；显式配置可以减少环境差异。
+
+本项目在工作区根目录为 cloudnative_internship_plan_2028 时，使用以下配置：
+
+```json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "调试 CloudTask",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/cloudtask-go/day9/cmd/server",
+      "cwd": "${workspaceFolder}/cloudtask-go/day9/cmd/server"
+    }
+  ]
+}
+```
+
+如果直接打开 cloudtask-go 作为工作区，应去掉路径中重复的 `/cloudtask-go`。launch.json 位于当前工作区的 .vscode 目录下。
+
+在上述 cwd 下，`../../.env` 对应 day9/.env。如果将 cwd 改成 day9，则代码中应改用 `.env`。不要为了调试而在多个目录复制密码文件，优先保持配置和路径一致。
+
+### 12.3 F5 不会自动调用 HTTP 接口
+
+```text
+F5 → 调试器构建并启动 main
+   → 初始化配置、数据库和 Redis
+   → HTTP 服务开始监听
+   → 等待请求
+发送 GET /tasks/12
+   → 路由匹配
+   → Handler 解析 ID
+   → 执行到 Service 调用语句，断点暂停
+```
+
+GetTaskByID 不是程序启动时自动执行的函数。服务正常等待请求时没有停在 Handler 断点，是正常现象。
+
+### 12.4 实际操作步骤
+
+1. 确认 VS Code 已安装并启用 Go 扩展，Delve 调试工具可用；缺少工具时查看扩展提示。
+2. 停止之前通过 go run 启动的同端口服务，避免 8080 被占用，也避免请求发送给未受调试器控制的旧进程。
+3. 保存代码，在“运行和调试”面板选择“调试 CloudTask”，按 F5，或使用菜单“运行 → 启动调试”。
+4. 检查调试控制台或终端，确认没有编译、.env 加载或数据库初始化错误，且 HTTP 监听没有失败。单独打印 Starting server 不足以证明监听成功，还要检查后续错误。
+5. 对 Handler 中实际调用 Service 的可执行语句设置断点，不依赖行号永远是 39。
+6. 在浏览器访问接口，或在另一个 PowerShell 终端执行：
+
+```powershell
+curl.exe http://127.0.0.1:8080/tasks/12
+```
+
+7. 程序暂停后查看 idInt、ctx 等变量，按 F10 单步跳过，按 F11 进入 Service，按 F5 继续运行，按 Shift+F5 停止调试。
+
+请求需要匹配 GET /tasks/:id，且 ID 是合法正整数。无效 ID 会提前返回，无法到达调用 Service 的断点。
+
+### 12.5 按现象定位
+
+| 现象 | 优先检查 |
+|---|---|
+| F5 没有启动调试工具栏 | 当前调试配置、Go 扩展、快捷键绑定；尝试菜单启动并查看提示 |
+| 启动后立即退出 | 编译错误、.env 路径、数据库初始化失败、main 提前 return |
+| 报端口已占用 | 停止旧服务，或统一修改服务端口和请求地址 |
+| 服务运行但断点不命中 | 是否发送了正确请求，是否访问了当前调试进程 |
+| 断点为空心或提示未验证 | 查看断点提示，确认文件属于当前构建、入口与源码匹配，且行上有可执行代码 |
+| 已暂停但客户端一直等待 | Handler 尚未返回，通常是调试暂停的预期表现 |
+
+断点暂停期间真实时间仍继续流逝，Context 的截止时间可能到期；逐步执行后出现超时，不一定代表正常运行时也会超时。不要为此直接移除生产逻辑中的超时和取消处理。
+
+本节记录配置检查与建议操作，未实际通过 VS Code 启动调试器验证。调试配置字段参考 [Go 扩展官方调试文档](https://github.com/golang/vscode-go/blob/master/docs/debugging.md)。
+
+## 13. 空值缓存：缓存穿透防护与修复复盘
+
+### 13.1 为什么缓存“不存在”
+
+缓存穿透指请求的数据在缓存和数据库中都不存在，反复查询仍会访问数据库。针对相同不存在 ID，可短暂缓存数据库确认的“不存在”结论，减少重复回源。
+
+该结论不是永久事实：后续创建、导入或恢复记录时可能改变。因此当前空值 TTL 为 30 秒，正常任务 TTL 为 5 分钟。短 TTL 平衡数据库保护、结果新鲜度和随机 ID 产生的缓存空间占用。新建记录时也应考虑清除对应空值，或明确接受剩余 TTL 内的短暂旧结论。
+
+仅 PostgreSQL 明确返回 ErrTaskNotFound 才写空值。连接失败、超时、权限错误都不是“不存在”，不能据此写空值。
+
+### 13.2 存储格式与返回类型
+
+两个类型都定义在 internal/cache/task_cache.go，分别表达内部存储协议和对 Service 的返回结果：
+
+```go
+// Redis 内部 JSON 格式，小写类型仅在 cache 包内使用。
+type taskCacheEntry struct {
+    Exists bool        `json:"exists"`
+    Task   *model.Task `json:"task,omitempty"`
+}
+
+// 对外查询结果，大写类型允许 Service 使用。
+type TaskCacheResult struct {
+    Hit    bool
+    Exists bool
+    Task   model.Task
+}
+```
+
+```json
+{"exists":true,"task":{"id":12,"title":"学习 Redis"}}
+```
+
+上面只节选任务字段。空值缓存则为：
+
+```json
+{"exists":false}
+```
+
+Task 是指针，nil 加上 omitempty 可以省略 task 字段；`&model.Task{}` 是非 nil 指针，不会被省略。
+
+| 状态 | Hit | Exists | err | Service 行为 |
+|---|---|---|---|---|
+| Redis 没有 key | false | 无意义 | nil | 查数据库 |
+| 命中不存在缓存 | true | false | nil | 返回任务不存在 |
+| 命中正常任务 | true | true | nil | 返回任务 |
+| Redis 访问或缓存解析失败 | 不使用 | 不使用 | 非 nil | 记录错误并回源 |
+
+Hit 表示有可用缓存结论，不代表任务一定存在；只有 Hit 为 true 时才解释 Exists。
+
+当前方法为 GetResult、SetEntry、SetNotFound、DeleteTask，使用 `cloudtask:task:<id>:v2`。升级版本用于隔离原来的裸 Task JSON。旧 v1 可自然过期，不必清空整个 Redis。
+
+### 13.3 四处问题的修复情况
+
+| 问题 | 当前源码状态 |
+|---|---|
+| 按 model.Task 解析包装 JSON，得到零值任务 | 已改为解析 taskCacheEntry，但遗漏空值分支，尚未完整修复 |
+| Service 命中后不检查 Exists | 已修复：Exists=false 返回 repository.ErrTaskNotFound |
+| 数据库未找到分支未判 nil、缓存错误覆盖数据库错误、返回 nil 错误 | 已修复：先判断缓存对象，写入失败仅记录，最终返回原数据库错误 |
+| SetNotFound 保存非 nil 的零值 Task 指针 | 已修复：Task=nil，JSON 只保留 exists=false |
+
+原先将包装 JSON 解码为 Task 时，encoding/json 默认忽略未知字段，可能没有解析错误却得到零值 Task。“Unmarshal 返回 nil”不等于业务内容正确，还需校验缓存协议和任务 ID。
+
+### 13.4 GetResult 仍缺少的关键分支
+
+当前读取在解析 entry 后立即判断：
+
+```go
+if entry.Task == nil || entry.Task.ID != id {
+    return TaskCacheResult{}, fmt.Errorf("任务缓存内容无效：id=%d", id)
+}
+```
+
+合法空值恰好是 Exists=false、Task=nil，所以会被误判为无效缓存。Service 随后继续查询数据库，并再次写入空值；接口可以正确返回 404，但防穿透并未生效，反复请求还可能不断刷新 30 秒 TTL。
+
+应先识别不存在结论，再校验正常任务。以下是建议补齐的分支，当前尚未写入业务源码：
+
+```go
+var entry taskCacheEntry
+if err := json.Unmarshal(data, &entry); err != nil {
+    return TaskCacheResult{}, err
+}
+
+if !entry.Exists {
+    return TaskCacheResult{
+        Hit:    true,
+        Exists: false,
+    }, nil
+}
+
+if entry.Task == nil || entry.Task.ID != id {
+    return TaskCacheResult{}, fmt.Errorf("任务缓存内容无效：id=%d", id)
+}
+
+return TaskCacheResult{
+    Hit:    true,
+    Exists: true,
+    Task:   *entry.Task,
+}, nil
+```
+
+该示例假设 v2 只由遵循协议的写入方法维护。若要严格识别缺失 exists 字段、空对象或 JSON null 等异常内容，还需增加协议字段存在性校验，不能把所有缺失布尔字段都当成合法空值。
+
+### 13.5 Service 保留数据库结果语义
+
+缓存命中后的处理：
+
+```go
+if err != nil {
+    log.Printf("读取缓存失败，准备回源：%v", err)
+} else if result.Hit {
+    if !result.Exists {
+        return model.Task{}, repository.ErrTaskNotFound
+    }
+    return result.Task, nil
+}
+```
+
+数据库明确未找到后的处理：
+
+```go
+task, err := s.taskRepository.GetTaskByID(ctx, id)
+if errors.Is(err, repository.ErrTaskNotFound) {
+    if s.taskCache != nil {
+        if cacheErr := s.taskCache.SetNotFound(ctx, id); cacheErr != nil {
+            log.Printf("空值缓存写入失败：id=%d err=%v", id, cacheErr)
+        }
+    }
+    return model.Task{}, err
+}
+if err != nil {
+    return model.Task{}, err
+}
+// 查询成功：尝试 SetEntry，再返回 task。
+```
+
+Repository 将 pgx.ErrNoRows 转换为项目的 repository.ErrTaskNotFound；Service 决定写空值；Handler 使用 errors.Is 将未找到映射为 404。错误通过 %w 包装仍可识别，不应靠 Task.ID==0 或错误文本比较。
+
+Redis 离线时，空值写入失败不能覆盖数据库的未找到错误，否则本应返回 404 的请求会错误地变成 500。未启用缓存时也应安全返回 404，而不是调用 nil 对象。
+
+### 13.6 剩余清理与验证
+
+遗留 fun1 仍使用 v2 key 写入裸 Task JSON，目前不是 HTTP 请求路径，但如果以后调用，会污染新格式。应删除旧练习写入，或改用 SetEntry；不应在 v2 下混用两种协议。更新、删除的失效也要和读写使用相同 v2 key，当前 DeleteTask 已使用 v2。
+
+| 验证场景 | 预期 |
+|---|---|
+| 存在 ID 首次请求 | 查库、写正常包装 JSON，返回完整 Task |
+| 存在 ID 再次请求 | 命中正常缓存，数据与数据库一致 |
+| 不存在 ID 首次请求 | 查库、写 exists=false，返回 404 |
+| 同一不存在 ID 在 30 秒内再次请求 | 命中空值、返回 404，不增加数据库回源次数 |
+| 空值过期后请求 | 再次查库，根据当前结果重建缓存 |
+| Redis 离线、数据库无该记录 | 记录缓存错误，最终仍返回 404 |
+| 缓存对象为 nil、数据库无该记录 | 正常返回 404，不 panic |
+| 正常任务缓存内容缺失或 ID 错误 | 视为无效缓存并回源，不能返回零值任务 |
+
+验证空值是否有效，必须看数据库查询计数或回源日志，不能只看接口一直返回 404。缓存穿透防护主要减少同一不存在 ID 的重复回源；大量不同随机 ID 仍可能访问数据库，短 TTL 空值缓存不等于覆盖全部穿透场景。
+
+本节基于最新保存的源码检查，未执行接口或数据库验证；只更新笔记，不修改业务代码。
