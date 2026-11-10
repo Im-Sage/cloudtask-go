@@ -1,6 +1,6 @@
 # 引入 Redis：从容器配置到任务缓存
 
-> 阶段笔记，整理于 2026-11-07。以 day9 项目当前代码为基础；标为“建议”的示例不代表源码已经完成修改。
+> 阶段笔记，更新于 2026-11-09。以 day9 项目当前保存的代码为基础；历史示例保留学习过程，标为“建议”的方案不代表源码已经完成修改。最新布隆过滤器进度与边界见第 14—16 节。
 
 ## 目录
 
@@ -17,6 +17,9 @@
 11. Redis 故障降级复盘
 12. VS Code 断点调试与工作目录
 13. 空值缓存：缓存穿透防护与修复复盘
+14. 布隆过滤器接入：构建、查询与增量维护
+15. 布隆过滤器接入中的问题复盘
+16. 本阶段验收与下一步
 
 ## 1. 阶段目标与当前进度
 
@@ -52,6 +55,11 @@
 | 正常任务与空值缓存使用包装 JSON，key 升级 v2 | 已实现 |
 | Service 区分空值命中，并保留数据库未找到错误 | 已实现 |
 | 空值缓存有效命中、阻止重复回源 | 尚缺 GetResult 的 Exists=false 返回分支，见第 13 节 |
+| RedisBloom 模块与 BF 命令 | Compose 已显式加载模块 |
+| TaskBloom 的构建、增量加入和查询 | 已实现 BFReserve、BFMAdd、BFAdd、BFExists |
+| 启动全量装载与 UUID 构建 key | 已实现，失败时注入 nil 禁用过滤器 |
+| 新建任务后维护布隆过滤器 | 已加入 Add、nil 判断和失败日志 |
+| 运行期过滤器有效性、新增同步失败后的处理 | 待完善，目前否定结果仍直接拦截 |
 
 ## 2. Docker Compose 配置、网络与认证
 
@@ -72,7 +80,10 @@ services:
     command:
       - sh
       - -c
-      - 'exec redis-server --requirepass "$$REDIS_PASSWORD"'
+      - |
+        exec redis-server \
+          --requirepass "$$REDIS_PASSWORD" \
+          --loadmodule /usr/local/lib/redis/modules/redisbloom.so
     healthcheck:
       test:
         - CMD-SHELL
@@ -977,3 +988,447 @@ Redis 离线时，空值写入失败不能覆盖数据库的未找到错误，�
 验证空值是否有效，必须看数据库查询计数或回源日志，不能只看接口一直返回 404。缓存穿透防护主要减少同一不存在 ID 的重复回源；大量不同随机 ID 仍可能访问数据库，短 TTL 空值缓存不等于覆盖全部穿透场景。
 
 本节基于最新保存的源码检查，未执行接口或数据库验证；只更新笔记，不修改业务代码。
+
+## 14. 布隆过滤器接入：构建、查询与增量维护
+
+### 14.1 与空值缓存配合的目的
+
+空值缓存擅长减少同一个不存在 ID 的重复回源；大量不同的随机 ID 仍可能逐个访问数据库。布隆过滤器用于在回源前排除明显未加入过的 ID。
+
+| 组件 | 保存的内容 | 结论 |
+|---|---|---|
+| PostgreSQL | 完整任务记录 | 业务数据的最终依据 |
+| 任务缓存 | 正常 Task 包装 JSON 或不存在结论 | 命中则复用最近查询结果 |
+| 布隆过滤器 | 已加入 ID 的概率性标记 | 未加入，或可能加入过 |
+
+过滤器不判断任务缓存是否存在。任务缓存过期，过滤器中的标记不会因此消失。只有数据库 ID 已完整装载且增量同步正确时，否定结果才可辅助判断数据库不存在。
+
+允许假阳性：不存在的 ID 可能被放行；对已成功加入且过滤器未损坏的元素，不会因概率性碰撞产生假阴性。漏装载、新增未同步和过滤器丢失属于维护错误，不能归因于正常误判率。
+
+### 14.2 对象、key 与依赖注入
+
+```go
+type TaskBloom struct {
+    client *redis.Client
+    key    string
+}
+```
+
+key 是整个过滤器的 Redis 名称，不是单个任务 ID：
+
+```text
+cloudtask:task:12:v2                → 任务 12 的普通/空值缓存
+cloudtask:task:bloom:build:<UUID>   → 一组任务 ID 的过滤器
+```
+
+TaskBloom 必须大写，Service 才能声明 `*cache.TaskBloom`。task_cache.go 和 task_bloom.go 虽同属 package cache，但 Service 属于另一个包，不能访问 cache.taskBloom。client、key 保持私有即可。
+
+当前 TaskService 通过 NewTaskService 同时接收 Repository、TaskCache 和 TaskBloom。TaskBloom 不持有 Repository：由启动流程取 ID，再交给 Build，保持数据库读取与 Redis 操作的分工。
+
+### 14.3 Build、Add、MayContain
+
+| 方法 | 当前职责 |
+|---|---|
+| Build(ctx, ids) | 创建新过滤器，批量装载已有 ID |
+| Add(ctx, id) | 新增单个 ID，供新建任务等增量维护使用 |
+| MayContain(ctx, id) | 查询 ID 是否可能已加入 |
+
+当前 Build 使用目标误判率 0.001、初始容量 100000，每批 1000 个 ID。关键调用：
+
+```go
+b.client.BFReserve(ctx, b.key, 0.001, 100000).Err()
+b.client.BFMAdd(ctx, b.key, items...).Err()
+b.client.BFAdd(ctx, b.key, id).Err()
+b.client.BFExists(ctx, b.key, id).Result()
+```
+
+BFMAdd 接收多个元素，需要把 []int64 转为 []interface{} 或 []any，再用 `items...` 展开。BFAdd 只加入一个元素，不能把 ID 切片整体传进去充当批量加入。
+
+Add 与 Build 的底层写入目的相似，但生命周期不同：前者是单条增量，后者包含创建与全量装载。Build 逐个调用 Add 也可以，但会产生更多网络往返。
+
+### 14.4 启动与请求生命周期
+
+```text
+main
+  → 创建数据库连接池和 Redis Client
+  → 生成构建 key，创建 TaskBloom
+  → Repository.GetIds(ctx) 查询数据库 ID
+  → TaskBloom.Build(ctx, ids)
+      → 失败：taskBloom=nil
+      → 成功：将对象注入 Service
+  → 启动 HTTP 服务
+```
+
+当前启动失败分支已真正设置 nil，不再只是打印“禁用”。不过 nil 只表示本次未启用对象，不代表运行期持续健康检查。
+
+CreateTask 已改为：数据库失败返回原错误；成功后在 taskBloom 非 nil 时 Add；加入失败记录任务 ID 和错误，仍返回数据库创建结果。查询目前则先检查过滤器，否定直接返回未找到，其余继续缓存和数据库流程。
+
+建议后续将任务缓存查询放在过滤器之前，减少热缓存请求的一次网络操作。更重要的是，在可信状态未完善前保持观察模式：过滤器否定时仍查数据库，验证是否存在遗漏。
+
+### 14.5 构建 key 的自动生成与重启
+
+```go
+bloomKey := "cloudtask:task:bloom:build:" + uuid.NewString()
+log.Printf("本次布隆过滤器 key：%s", bloomKey)
+taskBloom := cache.NewTaskBloom(rdb, bloomKey)
+```
+
+使用 github.com/google/uuid，每次构建生成一次，Build、Add、MayContain 共用同一个对象里的 key，不能每次操作都重新生成。
+
+固定 key 本身合法，但 BFReserve 对已存在 key 会报错；Add 则向原过滤器继续加入。不能把“启动”永远等同于“重新创建同名过滤器”，也不能仅凭 key 存在就认为它完整。
+
+当前每次启动新建 UUID 版本，避免手动递增 001、002；代价是重建开销和旧 key 积累。不要先删正在使用的版本再装载，以免把不完整状态暴露给查询。后续可以实现构建新版本、发布版本、延后清理旧版本，但需处理构建期间增量与多实例协调。
+
+### 14.6 可用性与存在性是两个维度
+
+曾讨论的建议类型：
+
+```go
+type BloomResult struct {
+    Usable   bool
+    MayExist bool
+}
+```
+
+MayExist 来自 BFExists 的返回值；Usable 表示系统是否允许依据这次否定结果拦截请求。命令成功不自动等于 Usable=true，过滤器 key 不存在时 BFExists 也可能正常返回 false。
+
+当前源码仍使用 `(bool, error)`，BloomResult 只是注释草稿，尚未实现。因此不能把“已注入对象”和“过滤器可信”混为一谈。构建完整性、版本仍存在、新增同步失败后的停用及重新启用条件，都需补齐。
+
+## 15. 布隆过滤器接入中的问题复盘
+
+### 15.1 COMMAND INFO 返回 nil：文件存在不代表模块已加载
+
+```powershell
+docker compose exec redis redis-cli --askpass COMMAND INFO BF.RESERVE
+```
+
+当时返回 `(nil)`，表示当前实例没有注册命令，不是密码错误。检查容器确认已含 `/usr/local/lib/redis/modules/redisbloom.so`，问题是自定义启动命令没有加载它。
+
+当前 Compose 已加入：
+
+```yaml
+command:
+  - sh
+  - -c
+  - |
+    exec redis-server \
+      --requirepass "$$REDIS_PASSWORD" \
+      --loadmodule /usr/local/lib/redis/modules/redisbloom.so
+```
+
+模块路径以实际镜像为准；不能仅凭此问题断言所有 redis:8-alpine 都不支持 Bloom。修改后运行 config 检查并更新容器，再通过 COMMAND INFO 和 MODULE LIST 确认实例实际能力。
+
+### 15.2 environment.command 验证错误：缩进改变配置含义
+
+错误为 `services.redis.environment.command must be a boolean, null, number or string`。command 多缩进后被当作环境变量，列表值不符合环境变量要求。
+
+command 应与 environment、ports、healthcheck 同级，不能放在 environment 内。排查时先读错误路径，再检查对应 YAML 层级。
+
+### 15.3 missing metadata：先看实际编译错误
+
+当时 cache 中写了 `repository.GetIds()`，但定义是：
+
+```go
+func (r *TaskRepository) GetIds(ctx context.Context) ([]int64, error)
+```
+
+它是对象方法，需要 `taskRepository.GetIds(ctx)`，不是包级函数；从外部取 ids 再传入 Build 后，TaskBloom 不需要导入 repository。
+
+missing metadata 是编辑器提示，不一定代表循环依赖或包未上传。应运行 go list、go build 查看底层原因。同包不能导入自己，但本次已确认的具体错误是 undefined: repository.GetIds。
+
+数据库遍历结束还应检查 rows.Err()，避免部分扫描失败却把过滤器当作完整装载。
+
+### 15.4 Go API 和错误处理易错点
+
+| 问题 | 正确处理 |
+|---|---|
+| BFExists 直接赋给两个变量 | 它返回 BoolCmd，需要 `.Result()` |
+| BFMAdd 传 items 而不是 items... | 展开切片，分别传入每个元素 |
+| log 导入未使用 | 删除或实际使用，否则编译失败 |
+| build 小写却从 main 调用 | 改为公开方法 Build |
+| fmt.Errorf(...) 作为独立语句 | 只创建 error，既不打印也不结束函数，需 return 或改用日志 |
+| Repository 创建失败返回 Task{}, nil | 应返回原 err，否则接口可能误报创建成功 |
+| 构建失败后仍调用 Add | 先判断对象非 nil，避免 panic |
+
+当前 CreateTask 已修复原错误返回、nil 判断和 Add 失败日志。GetTaskByID 仍无条件打印“布隆过滤器判断失败”，即使返回 true、nil 也会输出，后续应仅在 err 非 nil 时打印失败日志。
+
+### 15.5 新任务查不到：先确认正在查哪个版本
+
+曾在创建成功后查询 `cloudtask:task:bloom:build:001`，返回 0。此时 main 已使用 UUID key，Add 操作的是本次进程的新版本，旧版本不会自动同步。
+
+排查顺序：
+
+1. 从本次启动日志复制完整 bloomKey。
+2. 使用创建响应里的真实任务 ID。
+3. 检查 Add 失败日志，不把 HTTP 创建成功等同于 Redis 加入成功。
+4. 确认连接的是相同 Redis 实例和逻辑数据库；当前 Go 使用 DB 0。
+
+命令中的 `<UUID>` 是占位符，需替换后执行：
+
+```powershell
+docker compose exec redis redis-cli --askpass BF.EXISTS cloudtask:task:bloom:build:<UUID> 20017
+docker compose exec redis redis-cli --askpass BF.MEXISTS cloudtask:task:bloom:build:<UUID> 12 20017
+docker compose exec redis redis-cli --askpass BF.INFO cloudtask:task:bloom:build:<UUID>
+```
+
+BF.EXISTS 返回 1 表示可能加入过，0 表示未加入或过滤器不存在。过滤器保存位标记，不能列出原始 ID；验证完整性应把数据库 ID 集合逐个或分批查询，不能只看 BF.INFO 的统计。
+
+## 16. 本阶段验收与下一步
+
+### 16.1 已形成的功能方向
+
+已加入“空值缓存 + 布隆过滤器”的穿透防护主流程、UUID 构建版本、启动全量装载和创建后的增量加入；不能据此宣称全部正确性边界已解决。
+
+当前仍需优先处理：
+
+1. GetResult 在 Task=nil 校验之前处理 Exists=false。最新保存源码仍缺这一分支，合法空值仍会被判为异常并回源。
+2. 新任务提交后 Add 失败或尚未完成时，不能继续无条件信任否定结果；需有观察模式或可恢复的停用策略。不要在并发请求中无锁修改共享指针来充当健康状态。
+3. 运行中 Redis 重建、过滤器 key 丢失或部分恢复时，必须绕过否定拦截。单独先 EXISTS 再 BF.EXISTS 也有竞争窗口，需一致性检查。
+4. 启动中的 PostgreSQL 检查、Redis 检查、GetIds 和 Build 仍共享最外层 5 秒期限。前面耗时会压缩构建预算，建议初始化阶段分别设置合适的子期限，不让已过期 ctx 参与构建。
+5. 数据库扫描与构建期间的新写入、多个实例各自持有不同 UUID 版本、绕过服务直接导入数据等同步问题尚未解决。
+6. 定期清理确认不再使用的旧构建版本；清理不能删除其他实例仍在使用的过滤器。
+
+RedisBloom 本身不替你保证 PostgreSQL 与过滤器同步。BFAdd 在 key 丢失时还可能自动创建只含少数新 ID 的过滤器，因此“Add 成功”也不能证明全量过滤器完整。
+
+### 16.2 建议验证矩阵
+
+| 场景 | 期望与观测方式 |
+|---|---|
+| 已有 ID 全量装载 | 所有数据库 ID 在当前版本中返回可能存在 |
+| 正常任务缓存命中 | 返回完整任务，记录缓存命中 |
+| 同一不存在 ID 重复请求 | 用过滤器放行的无效 ID 验证空值命中，不重复回源 |
+| 大量不同不存在 ID | 观察模式统计潜在拦截率、回源数和误拦截情况 |
+| 新建任务 | 当前版本包含真实返回 ID，GET 可查到 |
+| Add 失败或请求取消 | 不把已提交任务错误地永久拦截；观察模式下仍可回源 |
+| 构建中途失败 | 不使用半成品过滤器，服务继续查询数据库 |
+| Go 重启 | 输出新 UUID，构建成功后使用，旧版本不误当作当前版本 |
+| Redis 关闭或重建 | 请求可回源，不出现已有任务被统一返回 404 |
+| 删除任务 | 不清除标准 Bloom 的共享位；查询以缓存失效和数据库结果为准 |
+
+验证空值缓存时，若过滤器已直接拦截同一 ID，请求不会到达空值分支，不能据此宣称空值命中有效。应在关闭否定拦截的观察模式中验证，或单独构造“过滤器放行但数据库不存在”的测试数据。
+
+本次更新依据 2026-11-09 保存的源码与此前排错记录，仅修改学习笔记；没有启停容器、创建任务或执行完整故障测试。当前属于已接入主流程、仍需补齐验证与一致性边界的阶段。
+
+## 17. 2026-11-10：缓存击穿复现与 singleflight 接入
+
+### 17.1 本次目标与涉及文件
+
+本次针对“同一个任务的缓存失效后，多个并发请求同时回源数据库”接入 singleflight。缓存穿透通常涉及不存在的数据；缓存击穿关注热点数据在缓存未命中期间的集中回源，两者需要分别处理。
+
+| 文件 | 本次用途 |
+|---|---|
+| `internal/service/task_test.go` | 使用真实 PostgreSQL、Redis，发起 50 个同 ID 的并发查询 |
+| `internal/service/singleflight_learning_test.go` | 使用模拟数据，观察 20 个调用共享一次回调结果 |
+| `internal/service/task_service.go` | 在缓存未命中或读取失败后合并同 key 的回源 |
+| `internal/repository/task_repository.go` | 在数据库查询前记录回源日志 |
+| `internal/cache/task_cache.go` | 读取空值缓存，区分缓存未命中与任务不存在 |
+
+测试放在 Service 所在目录，是因为需要检查缓存读取、数据库回源、缓存回填这一完整业务流程。测试函数使用 `TestXxx(t *testing.T)`，文件名以 `_test.go` 结尾。
+
+### 17.2 并发复现：统一准备依赖、集中放行请求
+
+集成测试先创建数据库连接池、TaskRepository、Redis Client、TaskCache 和 TaskService；本次还构建了布隆过滤器。所有 goroutine 共用同一个 TaskService，不在每个 goroutine 内重新创建依赖。后续 singleflight.Group 属于 Service 实例，只有共用实例才能通过同一个 Group 合并请求。
+
+复现前提：数据库中存在任务 12，Redis 正常可用，布隆过滤器允许该 ID 通过，并在并发开始前删除对应任务缓存。Redis 故障产生的回源应单独测试，不能混同为正常缓存失效场景。
+
+核心并发结构如下，`svc` 和 `ctx` 由前面的初始化阶段准备：
+
+```go
+var wg sync.WaitGroup
+startChannel := make(chan struct{})
+
+for i := 0; i < 50; i++ {
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        <-startChannel
+
+        task, err := svc.GetTaskByID(ctx, 12)
+        if err != nil {
+            t.Errorf("查询失败：%v", err)
+            return
+        }
+        if task.ID != 12 {
+            t.Errorf("期望 ID=12，实际 ID=%d", task.ID)
+        }
+    }()
+}
+
+close(startChannel)
+wg.Wait()
+```
+
+`make(chan struct{})` 创建一个只用于同步信号的无缓冲 channel。`<-startChannel` 接收但不保存值；没有数据且未关闭时阻塞，收到数据或 channel 关闭后可以继续执行。本例没有发送数据，使用 `close(startChannel)` 广播开始信号。
+
+关闭后，当前等待者和稍后运行到接收语句的 goroutine 都能继续。只发送一次 `startChannel <- struct{}{}` 则只会放行一个接收者。channel 只能关闭一次。
+
+集中放行不能保证所有 goroutine 在完全相同的时刻执行。若首次查询和回填非常快，部分请求可能直接命中缓存；稳定复现需要控制回源执行窗口，不能把请求数直接当成数据库查询数。
+
+### 17.3 如何统计回源，以及本次前后对比
+
+在 Repository.GetTaskByID 中，紧挨数据库 `QueryRow` 调用之前记录：
+
+```go
+log.Printf("[DB回源] GetTaskByID id=%d", id)
+```
+
+该日志统计到达数据库查询点的次数，也包括可能失败的查询；不表示这些 SQL 全部同时在数据库内执行，连接池可能让部分调用等待。不要把日志放在 Service 入口，否则统计到的是请求数。
+
+本次用户提供的两轮输出对比如下：
+
+| 观测项 | 接入前：10:04 | 接入后：11:26 |
+|---|---:|---:|
+| 并发请求数 | 50 | 50 |
+| `启用了缓存` 日志 | 50 | 50 |
+| `[DB回源] GetTaskByID id=12` 日志 | 50 | 1 |
+| 测试结果 | PASS | PASS |
+
+接入前，同一任务产生了 50 次回源；接入后，本轮只产生 1 次回源，且返回结果检查通过。`启用了缓存` 只代表进入缓存读取流程，不代表命中。
+
+这份日志不能区分哪些请求等待了 singleflight，哪些请求直接命中了回填后的缓存。PASS 也只说明现有断言通过：当前集成测试检查查询错误和任务 ID，并未自动断言数据库查询次数；本次次数来自日志统计。
+
+如需自动验收，可以在回源处使用 `atomic.Int64` 计数，在并发前后读取差值。普通整数的 `count++` 不适合多个 goroutine 并发修改。测试准备阶段的查询应排除在本轮计数之外。
+
+### 17.4 singleflight 学习测试与 WaitGroup 问题
+
+学习测试使用一个共享 Group，让 20 个 goroutine 调用相同 key 的 Do。在回调内用 `atomic.Int32.Add(1)` 统计实际执行次数，并用 `time.Sleep(100 * time.Millisecond)` 模拟耗时查询，返回字符串“任务12的数据”。
+
+只要调用在执行时间上重叠，同一 key 的调用就能共享回调结果。Sleep 便于演示，但不严格保证所有 goroutine 都在这一时间窗口内进入 Do；调度很晚的调用可能开启新一轮执行。因此该学习测试有调度时序的局限，不能当作严格同步证明。
+
+本次曾出现：
+
+```text
+20 个请求，回调实际执行 1 次
+panic: sync: negative WaitGroup counter
+```
+
+原因是在循环内、goroutine 外写了 `defer wg.Done()`，同时 goroutine 内也写了一次。20 次 Add 对应了 40 次 Done。外面的 defer 属于整个测试函数，不在单次循环结束时执行；goroutine 全部完成使计数归零后，测试函数退出又触发额外 Done，计数变为负数并 panic。
+
+当前已删除外层多余 defer，保留 goroutine 内的一次。原则是每个 `Add(1)` 对应一次 `Done()`，并在启动 goroutine 前完成 Add。
+
+### 17.5 Service 中的 Group、key 与返回值
+
+TaskService 新增字段：
+
+```go
+loadGroup singleflight.Group
+```
+
+Group 的零值可直接使用。构造函数原来按字段名初始化结构体，未填写的新字段自动取零值，因此 NewTaskService 参数和 main 调用不需要跟着改变。若改成 `*singleflight.Group`，零值会是 nil，需要初始化。Group 使用后不能复制，Service 继续使用指针接收者并共用实例。
+
+本次回源 key 为：
+
+```go
+key := fmt.Sprintf("task:%d", id)
+```
+
+相同任务使用相同 key，不同任务使用不同 key。固定为 `"task"` 会错误地合并不同任务；加入随机数或每次变化的时间戳则无法合并。key 不必等于 Redis key，但必须包含所有影响结果的条件；将来若引入租户隔离，应把租户 ID 也纳入 key。共享范围仅限当前 Group，不跨服务进程。
+
+Do 的返回值如下：
+
+| 返回值 | 含义与处理 |
+|---|---|
+| `value` | 类型为 any，来自回调的第一个返回值；本项目断言为 model.Task |
+| `err` | 回调返回的错误；先判断，非 nil 时向上返回 |
+| `shared` | 本次执行结果是否被多个调用共享；业务中用 `_` 忽略 |
+
+处理方式：
+
+```go
+if err != nil {
+    return model.Task{}, err
+}
+task, ok := value.(model.Task)
+if !ok {
+    return model.Task{}, fmt.Errorf("singleflight 返回类型异常：%T", value)
+}
+return task, nil
+```
+
+回调应统一返回 model.Task，不要有的分支返回值、有的分支返回指针。`shared=true` 不能判断谁执行了回调：执行者和等待者都可能返回 true。它也不表示 Redis 命中，不能直接统计 true 的数量来计算节省的查询数。
+
+### 17.6 双重检查：为什么 Do 内还要查 Redis
+
+当前 GetTaskByID 保留入口处的布隆过滤器检查，之后按以下路径处理：
+
+```text
+第一次读取 Redis
+  → 命中：返回任务或任务不存在
+  → 未命中或读取失败：进入 loadGroup.Do(task:<id>)
+      → 第二次读取 Redis
+          → 命中：返回任务或任务不存在
+          → 未命中或读取失败：查询数据库
+              → 任务不存在：写入空值缓存，返回未找到
+              → 其他数据库错误：返回错误
+              → 查询成功：回填任务缓存，返回任务
+```
+
+第一次检查到 Do 回调执行之间，缓存可能已经被其他请求回填。例如 A 查缓存未命中后暂停，B 完成回源并回填，待 A 再进入 Do 时，B 的那轮执行已经结束。singleflight 不缓存完成后的结果，此时 A 会执行新的回调；第二次检查缓存可以避免 A 再查一次数据库。
+
+第二次检查只在实际执行回调时进行，同一轮等待者直接共享结果。数据库查询和缓存回填都位于回调内，避免回调结束后才回填造成额外空窗。
+
+### 17.7 穿透防护、故障降级与本次修复
+
+接入 singleflight 后，Service 保留了以下处理：
+
+| 情况 | 当前处理 |
+|---|---|
+| 布隆过滤器返回不存在且无错误 | 返回 ErrTaskNotFound；可信性限制仍见前文 |
+| 布隆过滤器报错或未启用 | 继续缓存和数据库流程 |
+| Redis 读取报错 | 记录日志，进入或继续共享回源 |
+| 数据库任务不存在 | 尝试写入空值缓存，保留原未找到错误 |
+| 空值或任务缓存写入失败 | 记录日志，不覆盖数据库查询结果 |
+| 数据库其他错误 | 向上返回，不当作任务不存在缓存 |
+
+排查时发现 GetResult 原先在处理 Exists=false 之前就检查 Task=nil，而 SetNotFound 正常写入的恰好是 Exists=false、Task=nil，导致合法空值缓存被误判为无效内容并回源。
+
+截至本次文档更新，源码已在 Task 校验之前增加：
+
+```go
+if !entry.Exists {
+    return TaskCacheResult{
+        Hit:    true,
+        Exists: false,
+    }, nil
+}
+```
+
+这说明第 16 节记录的该项待办已在代码中修复；仍需单独验证空值命中，避免请求被布隆过滤器提前拦截而无法覆盖此分支。
+
+此前每个请求还会打印 `布隆过滤器判断失败：<nil>`。原因是正常放行分支也无条件打印失败日志。当前已改为仅在 err 非 nil 时记录，`<nil>` 本身不表示操作失败。
+
+降级仍受请求期限影响：Redis 等待若耗尽共用 ctx 的总期限，随后数据库查询也可能失败。保留降级路径不等于故障时一定查询成功。本次正常并发测试没有验证 Redis 宕机、超时和数据库失败。
+
+### 17.8 Context 的两个边界：当前尚未改造
+
+当前源码使用 `Do()`，回调捕获执行该回调的请求 ctx。需要区分两个问题：
+
+1. 等待者取消：B 正在 Do 内等待 A 的结果，即使 B 自己的 ctx 已取消，Do 也不会自动因此结束等待，因为 Do 没有监听 B 的 ctx.Done()。
+2. 执行者取消：若 A 用自己的 ctx 查询数据库，A 被取消可能使查询失败；共享这轮执行的 B 即使仍然有效，也会收到该取消错误。
+
+讨论过但尚未实现的方案：使用 DoChan，并在调用侧 select 结果 channel 和各自的 ctx.Done()，让每个等待者独立退出；共享查询另设有超时上限的 Context，避免绑定某一个请求的取消。
+
+仅更换为 DoChan 不会自动解除回调对执行者 ctx 的依赖。等待者返回也不会自动停止共享查询；共享查询必须有明确的超时和资源生命周期。不能给数据库查询简单换成没有期限的 Background 后就认为问题已经解决。
+
+### 17.9 执行命令与后续验收
+
+在 `cloudtask-go/day9/internal/service` 目录运行：
+
+```powershell
+go test -run '^TestSingleflightSameKey$' -v -count=1
+go test -run '^TestConcurrentCacheMiss$' -v -count=1
+```
+
+在 `cloudtask-go` 根目录运行时，在 go test 后加包路径 `./day9/internal/service`。
+
+`-run` 使用正则表达式，`^` 和 `$` 限定完整测试名；单引号用于 PowerShell 原样传参。`-v` 显示测试日志，`-count=1` 禁用测试结果缓存。每轮集成测试仍需清理 Redis 任务缓存，Go 测试结果缓存和 Redis 数据缓存是两回事。
+
+后续验证重点：
+
+- 保留同 ID 冷缓存并发检查，并增加回源次数的自动断言。
+- 不同 ID 并发返回各自任务，避免 key 设计造成串数据。
+- 验证不存在任务的空值命中、Redis 读写失败和数据库错误传播。
+- 修正测试初始化中的假通过：当前 .env 加载或数据库初始化失败仍可能打印后 return，应改为 t.Fatalf；Redis Ping 失败虽已 Fatalf，提示语“继续启动服务”仍需调整。
+- Context 取消和独立等待退出需另行实现、测试；多进程协调不在当前 singleflight.Group 的能力范围内。
+
+本节依据 2026-11-10 保存的源码及用户提供的测试输出整理。本次只更新学习文档，没有修改 Go 代码，也没有重新执行集成测试或故障测试。

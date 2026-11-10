@@ -75,6 +75,12 @@ func (c *TaskCache) GetResult(ctx context.Context, id int64) (TaskCacheResult, e
 			Task:   model.Task{},
 		}, err
 	}
+	if !entry.Exists {
+		return TaskCacheResult{
+			Hit:    true,
+			Exists: false,
+		}, nil
+	}
 	if entry.Task == nil || entry.Task.ID != id {
 		return TaskCacheResult{}, fmt.Errorf("任务缓存内容无效：id=%d", id)
 	}

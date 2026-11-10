@@ -3,12 +3,14 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"strings"
 
 	"github.com/Im-Sage/cloudtask-go/day9/internal/cache"
 	"github.com/Im-Sage/cloudtask-go/day9/internal/model"
 	"github.com/Im-Sage/cloudtask-go/day9/internal/repository"
+	"golang.org/x/sync/singleflight"
 )
 
 // 业务规则、事务用例
@@ -17,6 +19,7 @@ type TaskService struct {
 	taskRepository *repository.TaskRepository
 	taskCache      *cache.TaskCache
 	taskBloom      *cache.TaskBloom
+	loadGroup      singleflight.Group
 }
 
 func NewTaskService(
@@ -73,7 +76,9 @@ func (s *TaskService) GetTaskByID(
 			log.Printf("使用了布隆过滤器")
 			return model.Task{}, repository.ErrTaskNotFound
 		}
-		log.Printf("布隆过滤器判断失败：%v", err)
+		if err != nil {
+			log.Printf("布隆过滤器查询失败，继续查询缓存：%v", err)
+		}
 	}
 	// 如果启用了缓存，调用TaskCache.Get(ctx, id)，首先得明白什么叫启用缓存
 	if s.taskCache != nil {
@@ -92,31 +97,62 @@ func (s *TaskService) GetTaskByID(
 		}
 	}
 	// 未命中则准备开始回源
-	task, err := s.taskRepository.GetTaskByID(ctx, id)
-	// 这里task可能不存在，如果多次访问不存在task这就是缓存穿透
-	// 解决方法：既然PostgreSQL确认某个任务不存在，就可以把任务不存这个结果也缓存起来
-	// 另外一个方案是布隆过滤器
-	if errors.Is(err, repository.ErrTaskNotFound) {
-		// 判断是否启用了缓存
-		if s.taskCache != nil {
-			// 数据库中task不存在，在cache中缓存一个空值
-			if err := s.taskCache.SetNotFound(ctx, id); err != nil {
-				log.Printf("空值写入缓存失败：%v", err)
-				// return model.Task{}, err  redis宕机时，空值会写入失败，本质上还是任务不存在，
+	// 使用singleflight解决缓存击穿问题，singleflight的顺序是先检查缓存再查数据库
+	key := fmt.Sprintf("task:%d", id)
+	value, err, _ := s.loadGroup.Do(key,
+		func() (interface{}, error) {
+			// 再次查询缓存
+			if s.taskCache != nil {
+				cacheResult, err := s.taskCache.GetResult(ctx, id)
+				if err != nil {
+					// redis连接对象存在，但本次缓存操作失败
+					log.Printf("连接对象存在，但本次操作失败,原因：%v, 准备回源", err)
+				} else if cacheResult.Hit {
+					// 空值缓存时，exits为false，若不对exits作判断，则当成查询成功，会返回200和空任务
+					if !cacheResult.Exists {
+						return model.Task{}, repository.ErrTaskNotFound
+					}
+					// exits为true则说明数据库中本身就有该task
+					return cacheResult.Task, nil
+				}
 			}
-		}
-		// / 无论缓存是否写入成功，都保留数据库的“任务不存在”结果。
-		return model.Task{}, err
-	}
+			// 缓存依然没有命中，查询数据库
+			task, err := s.taskRepository.GetTaskByID(ctx, id)
+			// 这里task可能不存在，如果多次访问不存在task这就是缓存穿透
+			// 解决方法：既然PostgreSQL确认某个任务不存在，就可以把任务不存这个结果也缓存起来
+			// 另外一个方案是布隆过滤器
+			if errors.Is(err, repository.ErrTaskNotFound) {
+				// 判断是否启用了缓存
+				if s.taskCache != nil {
+					// 数据库中task不存在，在cache中缓存一个空值
+					if err := s.taskCache.SetNotFound(ctx, id); err != nil {
+						log.Printf("空值写入缓存失败：%v", err)
+						// return model.Task{}, err  redis宕机时，空值会写入失败，本质上还是任务不存在，
+					}
+				}
+				// / 无论缓存是否写入成功，都保留数据库的“任务不存在”结果。
+				return model.Task{}, err
+			}
+			if err != nil {
+				return model.Task{}, err
+			}
+			// 数据库查询成功后回填
+			if s.taskCache != nil {
+				// 将task写进Redis, Redis写入失败不应该影响数据库查询结果
+				if err := s.taskCache.SetEntry(ctx, id, task); err != nil {
+					log.Printf("写入redis失败：%v", err)
+				}
+			}
+			return task, nil
+		})
 	if err != nil {
 		return model.Task{}, err
 	}
-	// 数据库查询成功后回填
-	if s.taskCache != nil {
-		// 将task写进Redis, Redis写入失败不应该影响数据库查询结果
-		if err := s.taskCache.SetEntry(ctx, id, task); err != nil {
-			log.Printf("写入redis失败：%v", err)
-		}
+	task, ok := value.(model.Task)
+	if !ok {
+		return model.Task{}, fmt.Errorf(
+			"singleflight 返回类型异常：%T", value,
+		)
 	}
 	return task, nil
 }

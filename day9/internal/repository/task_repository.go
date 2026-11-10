@@ -68,6 +68,8 @@ func (r *TaskRepository) GetTaskByID(
 	// 执行SQL语句
 	var task model.Task // 定义一个task变量来存储查询结果
 
+	log.Printf("[DB回源] GetTaskByID id=%d", id)
+
 	err := r.pool.QueryRow(
 		ctx,
 		`select 
