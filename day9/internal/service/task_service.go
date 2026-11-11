@@ -130,7 +130,7 @@ func (s *TaskService) GetTaskByID(
 			// 缓存依然没有命中，查询数据库
 
 			// 使用令牌桶控制每秒的请求速率
-			if !s.limiter.Allow(){
+			if !s.limiter.Allow() {
 				return nil, repository.ErrRateLimited
 			}
 
@@ -194,7 +194,18 @@ func (s *TaskService) GetAllTasks(
 }
 
 func (s *TaskService) DeleteTask(ctx context.Context, id int64) error {
-	return s.taskRepository.DeleteTask(ctx, id)
+	// 同样的先删除数据库中的数据再删除缓存
+	if err := s.taskRepository.DeleteTask(ctx, id); err != nil {
+		return err
+	}
+	// 删除缓存
+	if s.taskCache != nil {
+		if err := s.taskCache.DeleteTask(ctx, id); err != nil {
+			// 若数据库删除失败不影响数据库更新操作
+			log.Printf("删除缓存失败：%v", err)
+		}
+	}
+	return nil
 }
 
 func (s *TaskService) UpdateTask(
@@ -214,9 +225,16 @@ func (s *TaskService) UpdateTask(
 	if err != nil {
 		return model.Task{}, err
 	}
+
+	invalidateCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		100*time.Millisecond,
+	)
+	defer cancel()
+
 	// 数据库更新成功则删除当前缓存，首先要判断是否开启了缓存
 	if s.taskCache != nil {
-		if err := s.taskCache.DeleteTask(ctx, id); err != nil {
+		if err := s.taskCache.DeleteTask(invalidateCtx, id); err != nil {
 			// 若数据库删除失败不影响数据库更新操作
 			log.Printf("删除缓存失败：%v", err)
 		}
@@ -228,12 +246,48 @@ func (s *TaskService) ChangeStatus(ctx context.Context, id int64, newStatus stri
 	if newStatus != "pending" && newStatus != "in_progress" && newStatus != "completed" {
 		return ErrInvalidStatus
 	}
-	return s.taskRepository.ChangeStatus(ctx, id, newStatus)
+	if err := s.taskRepository.ChangeStatus(ctx, id, newStatus); err != nil {
+		return err
+	}
+
+	invalidateCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		100*time.Millisecond,
+	)
+	defer cancel()
+
+	// 数据库更新成功则删除当前缓存，首先要判断是否开启了缓存
+	if s.taskCache != nil {
+		if err := s.taskCache.DeleteTask(invalidateCtx, id); err != nil {
+			// 若数据库删除失败不影响数据库更新操作
+			log.Printf("删除缓存失败：%v", err)
+		}
+	}
+	return nil
 }
 
 func (s *TaskService) ChangeStatusOptimistis(ctx context.Context, id int64, newStatus string, expectedVersion int64) (model.Task, error) {
 	if newStatus != "pending" && newStatus != "in_progress" && newStatus != "completed" {
 		return model.Task{}, ErrInvalidStatus
 	}
-	return s.taskRepository.ChangeStatusOptimistis(ctx, id, newStatus, expectedVersion)
+
+	task, err := s.taskRepository.ChangeStatusOptimistis(ctx, id, newStatus, expectedVersion)
+
+	if err != nil {
+		return model.Task{}, err
+	}
+
+	invalidateCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		100*time.Millisecond,
+	)
+	defer cancel()
+	// 数据库更新成功则删除当前缓存，首先要判断是否开启了缓存
+	if s.taskCache != nil {
+		if err := s.taskCache.DeleteTask(invalidateCtx, id); err != nil {
+			// 若数据库删除失败不影响数据库更新操作
+			log.Printf("删除缓存失败：%v", err)
+		}
+	}
+	return task, nil
 }

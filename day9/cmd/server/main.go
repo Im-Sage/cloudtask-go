@@ -19,6 +19,40 @@ import (
 	"github.com/google/uuid"
 )
 
+func cleanupOldBloomKeys(
+	ctx context.Context,
+	rdb *redis.Client,
+	currentKey string,
+) error {
+	const pattern = "cloudtask:task:bloom:build:*"
+
+	var cursor uint64
+	for {
+		keys, next, err := rdb.Scan(ctx, cursor, pattern, 100).Result()
+		if err != nil {
+			return fmt.Errorf("扫描旧过滤器失败：%w", err)
+		}
+
+		var oldKeys []string
+		for _, key := range keys {
+			if key != currentKey {
+				oldKeys = append(oldKeys, key)
+			}
+		}
+
+		if len(oldKeys) > 0 {
+			if err := rdb.Unlink(ctx, oldKeys...).Err(); err != nil {
+				return fmt.Errorf("清理旧过滤器失败：%w", err)
+			}
+		}
+
+		cursor = next
+		if cursor == 0 {
+			return nil
+		}
+	}
+}
+
 // 初始化连接池、配置路由、启动HTTP服务
 
 func main() {
@@ -63,9 +97,8 @@ func main() {
 	}
 
 	taskRepository := repository.NewTaskRepository(pool)
-	
+
 	bloomKey := "cloudtask:task:bloom:build:" + uuid.NewString()
-	log.Printf("本次布隆过滤器 key：%s", bloomKey)
 	taskBloom := cache.NewTaskBloom(rdb, bloomKey)
 	ids, err := taskRepository.GetIds(ctx)
 	if err == nil {
@@ -74,6 +107,31 @@ func main() {
 	if err != nil {
 		log.Printf("构建过滤器失败：禁用否定拦截：%v", err)
 		taskBloom = nil
+
+		cleanupCtx, cancel := context.WithTimeout(
+			context.WithoutCancel(ctx),
+			time.Second,
+		)
+		// 清理失败时的半成品
+		cleanupErr := rdb.Unlink(cleanupCtx, bloomKey).Err()
+		cancel()
+
+		if cleanupErr != nil {
+			log.Printf("清理构建失败的过滤器失败：key=%s err=%v",
+				bloomKey, cleanupErr)
+		}
+	} else {
+		log.Printf("布隆过滤器构建成功：key=%s", bloomKey)
+		cleanupCtx, cleanupCancel := context.WithTimeout(
+			context.WithoutCancel(ctx),
+			3*time.Second,
+		)
+		cleanupErr := cleanupOldBloomKeys(cleanupCtx, rdb, bloomKey)
+		cleanupCancel()
+
+		if cleanupErr != nil {
+			log.Printf("清理旧过滤器失败：%v", cleanupErr)
+		}
 	}
 
 	taskCache := cache.NewTaskCache(rdb)
@@ -88,41 +146,4 @@ func main() {
 	if err := http.ListenAndServe(addr, router); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
-
-	// task, err := taskRepository.CreateTask(ctx,"outlook","outlook is a email client")
-	// if err != nil {
-	// 	log.Fatalf("Failed to create task: %v", err)
-	// }
-	// log.Printf("Created task: %v", task)
-
-	// 获取刚刚获取的任务
-	// task, err := taskRepository.GetTaskByID(ctx, task.ID)
-	// if err != nil {
-	// 	log.Fatalf("Failed to get task: %v", err)
-	// }
-	// log.Printf("Retrieved task: %v", task)
-
-	// 获取所有的任务
-	// tasks, err := taskRepository.GetAllTasks(ctx)
-	// if err != nil {
-	// 	log.Fatalf("Failed to create task: %v", err)
-	// }
-	// for _, task := range tasks {
-	// 	log.Printf("task%d为:%v", task.ID, task)
-	// }
-
-	// 更新id为8的任务
-	// task, err := taskRepository.UpdateTask(ctx, 11, "现阶段目标：找到一个真正快乐的工作", "in_progress")
-	// if err != nil {
-	// 	log.Fatalf("Failed to update task:%v", err)
-	// }
-	// log.Printf("Retrieved task: %v", task)
-
-	// 删除id为11的任务
-	// err = taskRepository.DeleteTask(ctx,5)
-	// if err!=nil {
-	// 	log.Fatalf("Failed to delete task: %v", err)
-	// }
-	// fmt.Printf("delete success")
-
 }
