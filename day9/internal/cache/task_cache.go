@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"os"
 	"time"
 
@@ -45,6 +46,15 @@ func taskKey(id int) string {
 
 func taskKey2(id int) string {
 	return fmt.Sprintf("cloudtask:task:%d:v2", id)
+}
+
+// randomTTL 返回 [base, base+maxJitter) 范围内的随机 TTL。
+// base 必须大于 0，maxJitter 必须非负。
+func randomTTL(base, maxJitter time.Duration) time.Duration {
+	if maxJitter == 0 {
+		return base
+	}
+	return base + time.Duration(rand.Int64N(int64(maxJitter)))
 }
 
 // 从cache中读取task
@@ -93,6 +103,8 @@ func (c *TaskCache) GetResult(ctx context.Context, id int64) (TaskCacheResult, e
 
 // 向cache中写入task
 func (c *TaskCache) SetEntry(ctx context.Context, id int64, task model.Task) error {
+	writeCtx, writeCancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer writeCancel()
 	// 装填Entry
 	var taskEntry taskCacheEntry
 	taskEntry.Exists = true
@@ -104,7 +116,9 @@ func (c *TaskCache) SetEntry(ctx context.Context, id int64, task model.Task) err
 		return err
 	}
 	key := taskKey2(int(id))
-	err = c.client.Set(ctx, key, data, 5*time.Minute).Err()
+
+	ttl := randomTTL(10*time.Second, 60*time.Second)
+	err = c.client.Set(writeCtx, key, data, ttl).Err()
 	if err != nil {
 		return err
 	}
@@ -124,6 +138,8 @@ func (c *TaskCache) DeleteTask(ctx context.Context, id int64) error {
 }
 
 func (c *TaskCache) SetNotFound(ctx context.Context, id int64) error {
+	writeNotCtx, writeNotCancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer writeNotCancel()
 	var entry taskCacheEntry
 	entry.Exists = false
 	entry.Task = nil
@@ -133,7 +149,8 @@ func (c *TaskCache) SetNotFound(ctx context.Context, id int64) error {
 		log.Printf("序列化json失败：%v", err)
 		return err
 	}
-	if err := c.client.Set(ctx, taskKey2(int(id)), data, 30*time.Second).Err(); err != nil {
+	ttl := randomTTL(10*time.Second, 60*time.Second)
+	if err := c.client.Set(writeNotCtx, taskKey2(int(id)), data, ttl).Err(); err != nil {
 		return err
 	}
 	return nil

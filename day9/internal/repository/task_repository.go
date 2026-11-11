@@ -26,6 +26,7 @@ func NewTaskRepository(pool *pgxpool.Pool) *TaskRepository {
 
 var ErrTaskNotFound = errors.New("task not found")
 var ErrVersionConflict = errors.New("task version conflct")
+var ErrRateLimited = errors.New("请求过于频繁，请稍后重试")
 
 // 创建任务
 func (r *TaskRepository) CreateTask(

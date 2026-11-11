@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/Im-Sage/cloudtask-go/day9/internal/cache"
 	"github.com/Im-Sage/cloudtask-go/day9/internal/model"
 	"github.com/Im-Sage/cloudtask-go/day9/internal/repository"
 	"golang.org/x/sync/singleflight"
+	"golang.org/x/time/rate"
 )
 
 // 业务规则、事务用例
@@ -20,6 +22,9 @@ type TaskService struct {
 	taskCache      *cache.TaskCache
 	taskBloom      *cache.TaskBloom
 	loadGroup      singleflight.Group
+	// 这里使用信号量限制同时执行的数量,必须作为共享变量，要不然每个请求都将构建一个管道
+	slots   chan struct{}
+	limiter *rate.Limiter
 }
 
 func NewTaskService(
@@ -31,6 +36,8 @@ func NewTaskService(
 		taskRepository: taskRepository,
 		taskCache:      taskCache,
 		taskBloom:      taskBloom,
+		slots:          make(chan struct{}, 10),
+		limiter:        rate.NewLimiter(rate.Limit(10), 5),
 	}
 }
 
@@ -81,9 +88,11 @@ func (s *TaskService) GetTaskByID(
 		}
 	}
 	// 如果启用了缓存，调用TaskCache.Get(ctx, id)，首先得明白什么叫启用缓存
+	cacheCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
 	if s.taskCache != nil {
 		log.Printf("启用了缓存")
-		cacheResult, err := s.taskCache.GetResult(ctx, id)
+		cacheResult, err := s.taskCache.GetResult(cacheCtx, id)
 		if err != nil {
 			// redis连接对象存在，但本次缓存操作失败
 			log.Printf("连接对象存在，但本次操作失败,原因：%v, 准备回源", err)
@@ -103,7 +112,9 @@ func (s *TaskService) GetTaskByID(
 		func() (interface{}, error) {
 			// 再次查询缓存
 			if s.taskCache != nil {
-				cacheResult, err := s.taskCache.GetResult(ctx, id)
+				checkCtx, checkCancel := context.WithTimeout(ctx, 100*time.Millisecond)
+				defer checkCancel()
+				cacheResult, err := s.taskCache.GetResult(checkCtx, id)
 				if err != nil {
 					// redis连接对象存在，但本次缓存操作失败
 					log.Printf("连接对象存在，但本次操作失败,原因：%v, 准备回源", err)
@@ -117,6 +128,23 @@ func (s *TaskService) GetTaskByID(
 				}
 			}
 			// 缓存依然没有命中，查询数据库
+
+			// 使用令牌桶控制每秒的请求速率
+			if !s.limiter.Allow(){
+				return nil, repository.ErrRateLimited
+			}
+
+			// 使用信号量控制同时执行的请求数量
+			select {
+			case s.slots <- struct{}{}: // 获取名额
+				defer func() { <-s.slots }()
+				if err := ctx.Err(); err != nil { // 防止有空位和context超时 同时就绪的情况
+					return nil, err
+				}
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+
 			task, err := s.taskRepository.GetTaskByID(ctx, id)
 			// 这里task可能不存在，如果多次访问不存在task这就是缓存穿透
 			// 解决方法：既然PostgreSQL确认某个任务不存在，就可以把任务不存这个结果也缓存起来
