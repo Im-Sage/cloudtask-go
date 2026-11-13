@@ -3,13 +3,15 @@ package cache
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/redis/go-redis/v9"
 )
 
 type TaskBloom struct {
-	client *redis.Client
-	key    string
+	client  *redis.Client
+	key     string
+	trusted atomic.Bool // 初始值是false，默认不可信
 }
 
 // type BloomResult struct {
@@ -27,9 +29,14 @@ func NewTaskBloom(client *redis.Client, key string) *TaskBloom {
 func (b *TaskBloom) Add(ctx context.Context, id int64) error {
 	var itf any = id
 	if err := b.client.BFAdd(ctx, b.key, itf).Err(); err != nil {
-		return fmt.Errorf("想过滤器中加入单个任务失败：%w", err)
+		b.trusted.Store(false)
+		return fmt.Errorf("向过滤器中加入单个任务失败：%w", err)
 	}
 	return nil
+}
+
+func (b *TaskBloom) Trusted() bool {
+	return b.trusted.Load()
 }
 
 func (b *TaskBloom) MayContain(ctx context.Context, id int64) (bool, error) {
@@ -65,5 +72,6 @@ func (b *TaskBloom) Build(ctx context.Context, ids []int64) error {
 		}
 	}
 
+	b.trusted.Store(true)
 	return nil
 }

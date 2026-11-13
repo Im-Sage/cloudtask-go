@@ -3,13 +3,21 @@ package handler
 import (
 	"github.com/Im-Sage/cloudtask-go/day9/internal/service"
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // 注册Http 路由
 
-func NewRouter(taskService *service.TaskService) *gin.Engine {
+func NewRouter(taskService *service.TaskService, pool *pgxpool.Pool) *gin.Engine {
 	router := gin.Default()
 	taskHandler := NewTaskHandler(taskService)
+
+	healthHandler := NewHealthHandler(pool)
+
+	router.GET("/healthz", taskHandler.healthzSys)
+
+	router.GET("/readySys", healthHandler.readySys)
+
 
 	router.POST("/tasks", taskHandler.CreateTask)
 

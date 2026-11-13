@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"os"
 	"sync"
@@ -10,26 +9,26 @@ import (
 	"time"
 
 	"github.com/Im-Sage/cloudtask-go/day9/internal/cache"
+	"github.com/Im-Sage/cloudtask-go/day9/internal/config"
 	"github.com/Im-Sage/cloudtask-go/day9/internal/database"
 	"github.com/Im-Sage/cloudtask-go/day9/internal/repository"
 	"github.com/google/uuid"
-	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
 )
 
 func TestConcurrentCacheMiss(t *testing.T) {
-	if err := godotenv.Load("../../.env"); err != nil {
-		fmt.Println("加载 .env 失败:", err)
+	cfg, err := config.Load()
+	if err != nil{
+		log.Printf("配置文件加载失败：%v", err)
 		return
 	}
 	// 准备测试Service
-	dsn := "postgres://app:dev_password_only_local@localhost:5432/cloudtask?sslmode=disable"
 	ctx, cancel := context.WithTimeout(
 		context.Background(),
 		5*time.Second,
 	)
 	defer cancel()
-	pool, err := database.NewDBPool(ctx, dsn)
+	pool, err := database.NewDBPool(ctx, cfg.Postgres)
 	if err != nil {
 		log.Printf("数据库初始化失败：%v", err)
 		return
@@ -39,10 +38,10 @@ func TestConcurrentCacheMiss(t *testing.T) {
 
 	// 初始化redis连接
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     "127.0.0.1:6379",
-		Username: "default",
-		Password: os.Getenv("REDIS_PASSWORD"),
-		DB:       0,
+		Addr:     cfg.Redis.Addr,
+		Username: cfg.Redis.Username,
+		Password: cfg.Redis.Password,
+		DB:       cfg.Redis.DB,
 	})
 	defer rdb.Close()
 
@@ -110,18 +109,18 @@ func TestConcurrentCacheMiss(t *testing.T) {
 }
 
 func TestRandomTTL(t *testing.T) {
-	if err := godotenv.Load("../../.env"); err != nil {
-		fmt.Println("加载 .env 失败:", err)
+	cfg, err := config.Load()
+	if err != nil{
+		log.Printf("配置文件加载失败：%v", err)
 		return
 	}
 	// 准备测试Service
-	dsn := "postgres://app:dev_password_only_local@localhost:5432/cloudtask?sslmode=disable"
 	ctx, cancel := context.WithTimeout(
 		context.Background(),
 		5*time.Second,
 	)
 	defer cancel()
-	pool, err := database.NewDBPool(ctx, dsn)
+	pool, err := database.NewDBPool(ctx, cfg.Postgres)
 	if err != nil {
 		log.Printf("数据库初始化失败：%v", err)
 		return

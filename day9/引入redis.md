@@ -1,6 +1,6 @@
 # 引入 Redis：从容器配置到任务缓存
 
-> 阶段笔记，更新于 2026-11-11。以 day9 项目保存的代码和本阶段测试日志为基础；历史章节保留当时状态，标为“建议”的方案不代表源码已经完成修改。singleflight 见第 17 节；随机 TTL、Redis 故障超时和回源限流见第 18—20 节；写后缓存失效、布隆过滤器可信性及旧 Key 清理见第 21—22 节，状态有冲突时以最新章节为准。
+> 阶段笔记，更新于 2026-11-11。以 day9 项目保存的代码和本阶段测试日志为基础；历史章节保留当时状态，标为“建议”的方案不代表源码已经完成修改。singleflight 见第 17 节；随机 TTL、Redis 故障超时和回源限流见第 18—20 节；写后缓存失效及旧 Key 清理见第 21—22 节；布隆过滤器可信标记的最新进度见第 23 节，状态有冲突时以最新章节为准。
 
 ## 目录
 
@@ -26,6 +26,7 @@
 20. 回源保护：Semaphore、连接池与令牌桶
 21. 写后缓存失效与 WithoutCancel 的使用
 22. 布隆过滤器同步失败与单实例旧 Key 清理
+23. 增量同步失败后的可信标记与保守降级
 
 ## 1. 阶段目标与当前进度
 
@@ -1835,3 +1836,130 @@ UNLINK 从键空间移除指定 Key，并将内存回收交给后台处理，适
 | 当前过滤器被删除或过期 | 当前仍有误拦截风险；增加有效性策略后再验证 |
 
 第 21—22 节依据本轮保存的源码和讨论整理。旧 Key 清理已在源码接入，但本轮未运行清理操作或 Redis/PostgreSQL 集成测试；本次只修改学习笔记，不将讨论方案记为已完成验证。
+
+## 23. 增量同步失败后的可信标记与保守降级
+
+### 23.1 目标：不让不完整的过滤器证明任务不存在
+
+本方案针对 CreateTask 已提交 PostgreSQL、但 BF.ADD 增量同步失败的风险。详情缓存 SET 失败与布隆过滤器 Add 失败是两件事，只有后者直接涉及过滤器是否漏录。
+
+创建成功仍返回成功；过滤器增量同步失败后，将本地对象标记为不可信。后续即使 Redis 恢复、BF.EXISTS 正常返回 false，也不能使用这个否定结果直接返回未找到，而是继续走缓存与数据库。
+
+“不可信”不等于删除 Key，也不等于把过滤器指针置为 nil。它表示暂停使用否定结果进行拦截，Redis 中的数据可以保留，供排查或补偿使用。
+
+### 23.2 状态与并发安全
+
+当前 TaskBloom 已加入原子布尔状态：
+
+```go
+type TaskBloom struct {
+    client  *redis.Client
+    key     string
+    trusted atomic.Bool
+}
+
+func (b *TaskBloom) Trusted() bool {
+    return b.trusted.Load()
+}
+```
+
+需要导入 `sync/atomic`。atomic.Bool 零值为 false，新建对象默认不可信；它支持并发读写，避免普通 bool 被多个请求无同步地访问。包含原子字段的对象使用后不应再复制，当前使用 *TaskBloom 指针符合这一要求。
+
+```text
+新建过滤器：不可信
+    ↓ 完整构建成功
+可信：允许根据否定结果拦截
+    ↓ 任意一次增量 Add 失败
+不可信：查询回退到缓存、数据库
+    ↓ 确认数据完整并安全恢复
+可信
+```
+
+### 23.3 增量失败置为不可信，单次成功不恢复
+
+当前 Add 已实现：
+
+```go
+func (b *TaskBloom) Add(ctx context.Context, id int64) error {
+    if err := b.client.BFAdd(ctx, b.key, id).Err(); err != nil {
+        b.trusted.Store(false)
+        return fmt.Errorf("加入布隆过滤器失败：%w", err)
+    }
+    return nil
+}
+```
+
+失败原因可能是未写入，也可能是写入成功但响应丢失，应用无法确认，因此保守地标记不可信。
+
+之后其他 ID 的 Add 成功不能直接 Store(true)，因为这不证明之前漏录的 ID 已经补齐。当前代码没有在单次 Add 成功后恢复可信，这是正确的保守策略。
+
+### 23.4 查询侧如何处理否定结果
+
+当前 Service 已在否定拦截条件中增加 Trusted 判断：
+
+```go
+exists, err := s.taskBloom.MayContain(ctx, id)
+if !exists && err == nil && s.taskBloom.Trusted() {
+    return model.Task{}, repository.ErrTaskNotFound
+}
+// 不可信时，即使 exists=false，也继续原有缓存、数据库流程。
+```
+
+这已经可以在标记失效后停止使用否定结果。但当前仍会访问不可信过滤器，Redis 故障时可能继续产生等待和日志。可以进一步在查询前判断可信状态，跳过无必要的访问：
+
+```go
+// 建议写法，当前源码尚未加入入口处的 Trusted 判断。
+if s.taskBloom != nil && s.taskBloom.Trusted() {
+    exists, err := s.taskBloom.MayContain(ctx, id)
+    if err != nil {
+        log.Printf("过滤器查询失败，继续查询缓存和数据库：%v", err)
+    } else if !exists && s.taskBloom.Trusted() {
+        return model.Task{}, repository.ErrTaskNotFound
+    }
+}
+```
+
+查询后再次判断可以缩小并发 Add 失败时继续信任旧状态的窗口，但两次原子 Load 与数据库提交并不构成一个原子操作，不能据此宣称强一致。MayContain 仍应采用合理的操作超时。
+
+### 23.5 构建与恢复条件
+
+当前 Build 在所有批次加入完成后 Store(true)，但入口尚未 Store(false)。在启动时为新对象构建，零值已经是 false；如果以后复用同一个对象重新 Build，入口应先重置状态，避免失败后遗留旧的 true。
+
+```go
+// 构建流程示意，不是可直接替换现有方法的完整实现。
+func (b *TaskBloom) Build(ctx context.Context, ids []int64) error {
+    b.trusted.Store(false)
+    // 原有 BF.RESERVE、分批 BF.MADD；任意失败立即返回。
+    // 仅在完整装载成功后：
+    b.trusted.Store(true)
+    return nil
+}
+```
+
+当前 Build 使用 BF.RESERVE 创建新 Key，不能简单对已有 Key 原地再调一次就认为完成重建。较稳妥的恢复方式是创建新的 UUID 过滤器，完整构建后安全切换；运行期切换对象也需要并发安全管理。
+
+当前单实例可以先通过重启、在提供请求前重新全量构建来恢复。前提是 ID 装载完整且没有遗漏外部并发写入。自动补偿、运行期重建以及确认完整后的恢复逻辑尚未接入。
+
+若要运行期重建，必须协调构建期间的新增任务和失败事件：单纯读取一次 ID 列表，最后无条件 Store(true)，可能覆盖期间 Add 失败写入的 false。不能让 Build 与 Add 无协调地并发恢复可信状态。
+
+### 23.6 该方案没有解决的边界
+
+- 数据库提交到 Add 开始或完成之间，仍有新任务尚未同步的时间窗口；原子可信标记不能消除它。
+- trusted 是进程内状态，未来多个实例不会自动共享；某实例标记失效不代表其他实例也失效。
+- Redis Key 被删除、过期或数据丢失，不一定会更新本地 trusted；BF.EXISTS 返回 false、nil 也不证明 Key 完整有效。Key 生命周期与有效性检查仍需单独管理。
+- 不可信期间回源量会上升，继续依靠现有 Semaphore 和令牌桶保护数据库，不能把这段时间的数据库流量增长误判为标记失效。
+- 第 22 节“运行期可信标记尚未实现”的描述属于上一轮状态；本轮已加入基本标记和查询判断，但还没有完成上述补偿与验证。
+
+### 23.7 验证清单与本轮状态
+
+| 场景 | 应验证的行为 |
+|---|---|
+| 新对象未构建 | Trusted=false，否定结果不拦截 |
+| 完整构建成功 | Trusted=true，可以使用可信否定结果 |
+| 创建提交成功、Add 故障 | 创建仍成功，Trusted 变为 false |
+| Redis 恢复，但漏录 ID 未补齐 | 查询仍继续走缓存或数据库，不被 false 误拦截 |
+| 后续另一 ID 的 Add 成功 | 不自动恢复 Trusted=true |
+| 并发读写 trusted | 无数据竞争，可在适当测试中使用 -race 验证 |
+| 重新构建、补偿恢复 | 只有确认完整且协调并发后才能启用否定拦截 |
+
+截至本轮源码检查：atomic.Bool、Trusted、Add 失败置 false、Build 成功置 true，以及 Service 否定结果的可信判断已接入；Build 入口重置、查询前跳过不可信过滤器、自动恢复和 Key 丢失检测仍待完善。本次仅更新笔记，没有修改 Go 代码，也没有运行故障注入、集成或 race 测试。

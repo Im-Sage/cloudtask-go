@@ -78,7 +78,7 @@ func (s *TaskService) GetTaskByID(
 	} else { // 布隆出错或者id可能存在，要查询缓存或者是数据库
 		// 首先使用布隆过滤器判断id是否一定不存在
 		exists, err := s.taskBloom.MayContain(ctx, id)
-		if exists == false && err == nil {
+		if exists == false && err == nil && s.taskBloom.Trusted() {
 			// id必不存在，直接返回
 			log.Printf("使用了布隆过滤器")
 			return model.Task{}, repository.ErrTaskNotFound
@@ -198,9 +198,15 @@ func (s *TaskService) DeleteTask(ctx context.Context, id int64) error {
 	if err := s.taskRepository.DeleteTask(ctx, id); err != nil {
 		return err
 	}
+
+	invalidateCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		100*time.Millisecond,
+	)
+	defer cancel()
 	// 删除缓存
 	if s.taskCache != nil {
-		if err := s.taskCache.DeleteTask(ctx, id); err != nil {
+		if err := s.taskCache.DeleteTask(invalidateCtx, id); err != nil {
 			// 若数据库删除失败不影响数据库更新操作
 			log.Printf("删除缓存失败：%v", err)
 		}

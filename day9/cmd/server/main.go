@@ -2,18 +2,22 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/Im-Sage/cloudtask-go/day9/internal/cache"
+	"github.com/Im-Sage/cloudtask-go/day9/internal/config"
 	"github.com/Im-Sage/cloudtask-go/day9/internal/database"
 	"github.com/Im-Sage/cloudtask-go/day9/internal/handler"
 	"github.com/Im-Sage/cloudtask-go/day9/internal/repository"
 	"github.com/Im-Sage/cloudtask-go/day9/internal/service"
-	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/google/uuid"
@@ -53,47 +57,56 @@ func cleanupOldBloomKeys(
 	}
 }
 
-// 初始化连接池、配置路由、启动HTTP服务
-
 func main() {
-	if err := godotenv.Load("../../.env"); err != nil {
-		fmt.Println("加载 .env 失败:", err)
-		return
+	logger := slog.New(slog.NewJSONHandler(os.Stdout,
+		&slog.HandlerOptions{
+			Level: slog.LevelInfo,
+		},
+	))
+	if err := run(logger); err != nil {
+		logger.Error("服务退出", "error", err)
+		os.Exit(1)
 	}
-	dsn := "postgres://app:dev_password_only_local@localhost:5432/cloudtask?sslmode=disable"
+}
+
+// 初始化连接池、配置路由、启动HTTP服务
+func run(logger *slog.Logger) error {
+	cfg, err := config.Load()
+	if err != nil {
+		// log.Printf("配置文件加载失败：%v", err)
+		return fmt.Errorf("加载配置失败：%w", err)
+	}
 	ctx, cancel := context.WithTimeout(
 		context.Background(),
-		5*time.Second)
+		cfg.StartupTimeout)
 	defer cancel()
-
-	pgCtx, pgCancel := context.WithTimeout(
-		ctx,
-		5*time.Second)
-	defer pgCancel()
-	pool, err := database.NewDBPool(pgCtx, dsn) // 先把连接池初始化好
+	pool, err := database.NewDBPool(ctx, cfg.Postgres) // 先把连接池初始化好
 	if err != nil {
-		log.Fatalf("Failed to create connection pool: %v", err)
+		// log.Fatalf("Failed to create connection pool: %v", err)
+		return fmt.Errorf("数据库加载或连接失败：%w", err)
 	}
 
 	defer pool.Close() // 连接池成功创建，关闭应该由调用方负责
 
 	// 初始化redis连接
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     "127.0.0.1:6379",
-		Username: "default",
-		Password: os.Getenv("REDIS_PASSWORD"),
-		DB:       0,
+		Addr:     cfg.Redis.Addr,
+		Username: cfg.Redis.Username,
+		Password: cfg.Redis.Password,
+		DB:       cfg.Redis.DB,
 	})
 	defer rdb.Close()
 
 	redisCtx, redisCancel := context.WithTimeout(
 		ctx,
-		5*time.Second)
+		cfg.Redis.PingTimeout)
 	defer redisCancel()
 
 	err = rdb.Ping(redisCtx).Err()
 	if err != nil {
-		log.Printf("Redis 暂不可用，继续启动服务：%v", err)
+		// log.Printf("Redis 暂不可用，继续启动服务：%v", err)
+		logger.Warn("Redis 服务不可用，继续使用数据库",
+			"error", err)
 	}
 
 	taskRepository := repository.NewTaskRepository(pool)
@@ -105,7 +118,8 @@ func main() {
 		err = taskBloom.Build(ctx, ids)
 	}
 	if err != nil {
-		log.Printf("构建过滤器失败：禁用否定拦截：%v", err)
+		logger.Warn("构建过滤器失败：禁用否定拦截",
+			"error", err)
 		taskBloom = nil
 
 		cleanupCtx, cancel := context.WithTimeout(
@@ -117,8 +131,9 @@ func main() {
 		cancel()
 
 		if cleanupErr != nil {
-			log.Printf("清理构建失败的过滤器失败：key=%s err=%v",
-				bloomKey, cleanupErr)
+			logger.Warn("清理构建失败的过滤器失败：",
+				"key", bloomKey,
+				"error", err)
 		}
 	} else {
 		log.Printf("布隆过滤器构建成功：key=%s", bloomKey)
@@ -130,7 +145,8 @@ func main() {
 		cleanupCancel()
 
 		if cleanupErr != nil {
-			log.Printf("清理旧过滤器失败：%v", cleanupErr)
+			logger.Warn("清理旧过滤器失败",
+				"error", cleanupErr)
 		}
 	}
 
@@ -138,12 +154,64 @@ func main() {
 
 	taskService := service.NewTaskService(taskRepository, taskCache, taskBloom)
 
-	router := handler.NewRouter(taskService)
+	router := handler.NewRouter(taskService, pool)
 
-	// 启动HTTP服务
-	addr := ":8080"
-	fmt.Printf("Starting server on %s\n", addr)
-	if err := http.ListenAndServe(addr, router); err != nil {
-		log.Fatalf("Failed to start server: %v", err)
+	logger.Info("准备启动 HTTP 服务", "addr", cfg.Http.Addr)
+	// 创建http.Server
+	server := &http.Server{
+		Addr: cfg.Http.Addr,
+		// 处理请求的路由
+		Handler:           router,
+		ReadHeaderTimeout: cfg.Http.ReadHeaderTimeout,
+		WriteTimeout:      cfg.Http.WriteTimeout,
+		// 	保持连接时，等待下一次请求的最长空闲时间
+		IdleTimeout: cfg.Http.IdleTimeout,
+	}
+
+	sinalCtx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer stop()
+
+	serverErr := make(chan error, 1)
+
+	go func() {
+		serverErr <- server.ListenAndServe()
+	}()
+
+	select {
+	// 从错误通道里取错误
+	case err := <-serverErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			// 发生意外崩溃或底层网络错误而退出
+			return fmt.Errorf("HTTP 服务失败: %w", err)
+		}
+		return nil
+
+	case <-sinalCtx.Done():
+		// HTTP 服务器是通过显式调用 Server.Shutdown()
+		// 或 Server.Close() 被正常关闭的，
+		// 而不是因为发生意外崩溃或底层网络错误而退出的。
+		logger.Info("收到退出信号，开始关闭服务")
+		stop()
+
+		shutdownCtx, cancel := context.WithTimeout(
+			context.Background(),
+			10*time.Second,
+		)
+		defer cancel()
+
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			logger.Error("优雅关闭失败，强制关闭连接", "error", err)
+
+			if closeErr := server.Close(); closeErr != nil {
+				logger.Error("强制关闭失败", "error", closeErr)
+			}
+			return fmt.Errorf("HTTP 服务优雅关闭失败: %w", err)
+		}
+		logger.Info("HTTP 服务已关闭")
+		return nil
 	}
 }
