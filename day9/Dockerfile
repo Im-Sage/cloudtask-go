@@ -12,7 +12,12 @@ RUN GOPROXY=https://goproxy.cn,direct go mod download
 #复制整个day9中源码
 COPY day9 /cloudtask/day9/
 #编译Linux程序并明确输出位置
-RUN CGO_ENABLED=0 GOOS=linux go build -o /out/cloudtask-api ./day9/cmd/server
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/cloudtask-api ./day9/cmd/server
+
+
+
+
+
 
 # 运行阶段 
 # alpine是一个独立的基础镜像
@@ -22,6 +27,12 @@ FROM alpine:3.23 AS runtime
 # 如需验证HTTPS或数据库TLS证书，安装CA证书
 RUN apk add --no-cache ca-certificates
 
+
+# 创建 app 用户组和用户
+RUN addgroup -S -g 10001 app && adduser -S -D -H -u 10001 -G app app
+
+
+
 # 设置运行阶段的自己的工作目录
 WORKDIR /app
 
@@ -29,7 +40,10 @@ WORKDIR /app
 # COPY --from 的源路径从指定阶段的文件系统根目录开始解析
 # /out/cloudtask-api是构建阶段的输出文件
 # /app/cloudtask-api属于新的 Runtime 阶段。
-COPY --from=builder /out/cloudtask-api /app/cloudtask-api
+COPY --from=builder --chown=0:0 --chmod=0555 /out/cloudtask-api /app/cloudtask-api
+
+# 后续指令及容器默认进程使用此用户组中的用户，在此之前都是root
+USER 10001:10001
 
 # 配置API的启动命令
 CMD [ "/app/cloudtask-api" ]

@@ -109,7 +109,7 @@ func Load() (Config, error) {
 	postgresStru.PingTimeout = pgPingTimeout
 
 	var redisStru RedisConfig
-	redisStru.Addr = envOrDefault("REDIS_ADDR", "127.0.0.1:6379")
+	redisStru.Addr = envOrDefault("REDIS_ADDR", "redis:6379")
 	redisStru.Username = envOrDefault("REDIS_USERNAME", "default")
 	redisStru.Password = os.Getenv("REDIS_PASSWORD")
 	dbstr := os.Getenv("REDIS_DB")

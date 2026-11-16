@@ -39,11 +39,11 @@ func TestEnvConfig(t *testing.T) {
 HTTP_READ_HEADER_TIMEOUT=2s
 HTTP_WRITE_TIMEOUT=12s
 HTTP_IDLE_TIMEOUT=90s
-DATABASE_URL=postgres://test:test@localhost/test
+DATABASE_URL=postgres://test:test@db/test
 PG_MAX_CONNS=8
 PG_MIN_CONNS=2
 PG_PING_TIMEOUT=4s
-REDIS_ADDR=localhost:6380
+REDIS_ADDR=redis:6380
 REDIS_USERNAME=test-user
 REDIS_PASSWORD=test-password
 REDIS_DB=2
@@ -57,7 +57,7 @@ STARTUP_TIMEOUT=20s
 	want := Config{
 		Http: HttConfig{Addr: ":9090", ReadHeaderTimeout: 2 * time.Second,
 			WriteTimeout: 12 * time.Second, IdleTimeout: 90 * time.Second},
-		Postgres: PostgresConfig{DSN: "postgres://test:test@localhost/test", MaxConns: 8,
+		Postgres: PostgresConfig{DSN: "postgres://test:test@db/test", MaxConns: 8,
 			MinConns: 2, PingTimeout: 4 * time.Second},
 		Redis: RedisConfig{Addr: "localhost:6380", Username: "test-user", Password: "test-password",
 			DB: 2, PingTimeout: 1500 * time.Millisecond},
@@ -78,7 +78,7 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Http.Addr != ":8080" || cfg.Http.ReadHeaderTimeout != 5*time.Second ||
 		cfg.Http.WriteTimeout != 10*time.Second || cfg.Http.IdleTimeout != 60*time.Second ||
 		cfg.Postgres.MaxConns != 4 || cfg.Postgres.MinConns != 0 ||
-		cfg.Postgres.PingTimeout != 5*time.Second || cfg.Redis.Addr != "127.0.0.1:6379" ||
+		cfg.Postgres.PingTimeout != 5*time.Second || cfg.Redis.Addr != "redis:6379" ||
 		cfg.Redis.Username != "default" || cfg.Redis.DB != 0 ||
 		cfg.Redis.PingTimeout != 3*time.Second || cfg.StartupTimeout != 15*time.Second {
 		t.Fatal("缺省配置未使用约定的默认值")
@@ -99,7 +99,7 @@ func TestLoadInvalidValues(t *testing.T) {
 	} {
 		t.Run(tc.key+"/"+tc.value, func(t *testing.T) {
 			prepareEnv(t, "")
-			t.Setenv("DATABASE_URL", "postgres://test:test@localhost/test")
+			t.Setenv("DATABASE_URL", "postgres://test:test@db/test")
 			t.Setenv(tc.key, tc.value)
 			_, err := Load()
 			if err == nil || !strings.Contains(err.Error(), tc.key) {

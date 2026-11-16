@@ -2,9 +2,9 @@
 
 记录日期：2026-11-12。
 
-后续补充：2026-11-13，第 14～23 节记录迁移管理、备份恢复、日志、健康检查和优雅退出。前 13 节保留当时的排查过程；当前实现进度以第 23 节为准。
+后续补充：2026-11-13，第 14～23 节记录迁移管理、备份恢复、日志、健康检查和优雅退出。2026-11-16，第 24～34 节补充项目工程规范、Docker 多阶段构建、Compose 运行、交付及 Git 管理；第 35～41 节补充镜像瘦身、非 root 运行、Linux 权限及 docker run 环境变量引号问题。前文保留当时的排查过程；最新实现进度与待办以第 41 节为准。
 
-本次主要完成 CI/CD 前的配置管理准备：将连接地址、连接池参数、超时等从启动代码中提取，通过环境变量加载到 Config，再传给各组件。本文记录本次改动和排查过程，不表示 Docker 镜像构建、CI 流水线或自动部署已经完成。
+最初主要完成 CI/CD 前的配置管理准备：将连接地址、连接池参数、超时等从启动代码中提取，通过环境变量加载到 Config，再传给各组件。近期已进一步完成 Docker 镜像构建与本机 Compose 运行；用户已反馈构建及 API 访问成功。这仍不代表 CI 流水线、镜像自动发布或远程自动部署已经完成。
 
 ## 1. Config 结构与职责
 
@@ -791,3 +791,658 @@ go test ./day9/... -count=1
 - 标准 Shutdown 不处理所有后台任务和已劫持连接；后续若引入这类任务，需要单独设计生命周期。
 
 开发库 force 1 成功来自本次对话的操作反馈；临时库完整验收、备份恢复演练、故障退出结果需要各自保存执行记录。本次笔记更新没有删除数据卷、执行迁移、恢复备份或修改业务代码。
+
+## 24. 近期完善与项目工程规范
+
+补充日期：2026-11-16。以下区分代码现状、用户操作反馈和后续建议，不将讲解过的方案直接记为已完成。
+
+近期提交包括：
+
+- `3bbac84`：完善数据库迁移、健康检查与优雅退出。
+- `916a038`：完善 CloudTask 容器化部署与工程规范。
+- `5b8030a`：停止跟踪本地编译产物和环境配置。
+
+工程规范的目的，是让项目不依赖某个人电脑上的隐含条件，使其他人能理解、构建、运行和排查问题。
+
+| 方面 | 当前约定或实现 | 仍需注意 |
+| --- | --- | --- |
+| 模块与目录 | 根目录保存 go.mod、go.sum；day9/cmd/server 为 API 入口，internal 按配置、数据库、缓存、处理器、服务、仓储等分包 | 容器中保持模块内的 day9 路径层级 |
+| 配置管理 | Config 集中读取环境变量，提供默认值、类型转换和校验；.env.example 提供模板 | 真实 .env 与 .env.docker 不入库、不打进镜像；本机和容器地址分开 |
+| 数据库结构 | 使用版本化 up/down 迁移；业务表不再依赖旧初始化目录自动创建 | 新环境启动 API 前先执行迁移；不要修改已应用的迁移 |
+| 运行生命周期 | main/run 分工、错误向上返回、资源 defer 关闭、HTTP 超时与信号退出 | 不把“进程存在”当作“应用就绪” |
+| 可观测性 | slog JSON 启动日志、/healthz、/readyz、Compose 日志 | 当前仍混用 log.Printf 与 Gin 默认日志；/readyz 主要检查数据库 |
+| 构建与部署 | 固定 Go 1.26 系列，Docker 多阶段构建，Compose 管理三个服务 | 1.26 标签随补丁更新，并非不可变版本；严格复现时可进一步固定补丁或摘要 |
+| 版本控制 | 提交源码、模块文件、部署配置、迁移和文档 | 不跟踪本地可执行文件、数据库备份、真实凭据；忽略规则需覆盖正确目录 |
+| 交付文档 | 区分本机运行、容器运行、空库迁移和已有数据恢复 | 命令注明工作目录；在干净环境验证说明能否复现 |
+
+这些约定为后续 CI/CD 提供基础，但当前仓库尚未发现实际的 GitHub Actions 工作流。
+
+## 25. Docker 中的镜像、容器、网络与数据卷
+
+### 25.1 镜像与容器
+
+镜像是包含程序、文件和默认启动配置的只读模板；容器是根据镜像创建的实例，具有可写层、进程和通常隔离的网络环境。容器停止后仍存在，可以再次启动。
+
+容器与虚拟机的关键区别是内核：容器共享运行环境的内核，虚拟机有自己的内核。Windows Docker Desktop 的 Linux 容器通常运行在 WSL 2 等提供的 Linux 环境中，并不是直接共享 Windows 内核。
+
+### 25.2 服务名、容器名与服务发现
+
+Compose 的 `db`、`redis`、`api` 是服务名。实际容器名通常类似 `day9-db-1`，可以用 `docker compose ps -a` 确认。
+
+- `docker compose exec db sh`：Compose 根据服务名定位容器。
+- `docker exec -it day9-db-1 sh`：Docker 根据实际容器名定位容器。
+- 默认 Compose 网络中的容器通过内部 DNS，按服务名找到彼此的 IP。
+- IP 可能在重建后改变，连接时应使用服务名；连接断开后应用仍需重新解析、重连。
+
+服务发现就是“通过稳定名称找到服务地址”。它不会自动检查数据库业务表是否存在，也不会代替密码认证。
+
+### 25.3 localhost 与端口映射
+
+`localhost` 指当前网络环境自己，通常解析为 `127.0.0.1` 或 `::1`，不是服务名。
+
+| 连接发起位置 | PostgreSQL 地址 | Redis 地址 |
+| --- | --- | --- |
+| Windows 本机 API | 127.0.0.1:5432 | 127.0.0.1:6379 |
+| 同一 Compose 网络内的 API | db:5432 | redis:6379 |
+
+例如 `127.0.0.1:16379:6379` 表示只在宿主机回环地址开放 16379，将流量转发到 Redis 容器的 6379。容器间仍访问 `redis:6379`。左右端口不必相同；右边必须匹配程序实际监听的端口，程序自身的监听端口也可以通过配置改变。
+
+当前数据库与 Redis 的宿主机映射都已限制为 `127.0.0.1`。PostgreSQL 日志中的 `listening on 0.0.0.0` 描述容器内监听，不等于宿主机仍对所有网卡发布端口。
+
+### 25.4 数据卷的持久化边界
+
+```yaml
+volumes:
+  - postgres_data:/var/lib/postgresql/data
+```
+
+左边是 Docker 管理的命名卷，右边是 PostgreSQL 容器内的目录。默认实际卷名通常带项目名前缀，例如 `day9_postgres_data`；在 Docker Desktop → Volumes 可以查看内容。
+
+| 操作 | 数据影响 |
+| --- | --- |
+| 停止后启动同一个容器 | 原容器可写层和命名卷都保留 |
+| 删除并重建容器，挂载原卷 | 可以继续使用数据库文件 |
+| docker compose down | 默认保留这里的命名卷 |
+| docker compose down -v | 删除声明的数据卷，需避免误操作 |
+| 换项目名或换电脑 | 不会自动找到或复制旧电脑的卷 |
+
+持久化关键是卷独立于容器生命周期，而不只是“写到了磁盘”。数据库重启需要重新建立内存状态：PostgreSQL 按需读取数据库文件，异常退出后可能做 WAL 恢复；Redis 根据其持久化配置从 RDB/AOF 重建内存。Volume 保留文件，并不自动把尚未持久化的内存数据写入磁盘。
+
+## 26. go run、本机 go build 与 Docker 编译
+
+从模块根目录执行：
+
+```powershell
+# 编译后直接运行；通常使用临时可执行文件
+go run ./day9/cmd/server
+
+# 生成本机可执行文件，随后自行运行
+go build -o cloudtask-local.exe ./day9/cmd/server
+.\cloudtask-local.exe
+```
+
+两者都会编译。go run 不会在指定位置交付一个正式的可执行文件；go build 不会自动运行程序。修改源码后，旧 exe 不会更新，需要重新编译。
+
+| 对比 | 本机编译 | Docker builder 编译 |
+| --- | --- | --- |
+| Go 工具链 | 本机安装的 Go | golang:1.26 提供 |
+| 源码 | 电脑上的项目目录 | COPY 进入构建阶段的文件 |
+| 目标系统 | 取决于当前 Go 环境，Windows 本机通常为 Windows | 当前显式指定 GOOS=linux |
+| 输出 | 模块根目录下的 cloudtask-local.exe | builder 内部 /out/cloudtask-api |
+| 用途 | Windows 本机运行 | 复制到 Linux 运行镜像 |
+
+构建目标由 GOOS、GOARCH 等设置决定，不由 .exe 后缀决定。当前 Dockerfile 从源码编译，不需要先生成本地 exe。
+
+编译器根据入口包、直接或间接 import 的代码、模块依赖及构建配置生成程序；不会因为源码里调用了 PostgreSQL 或 Redis，就在编译时执行连接操作。数据库地址、密码、表是否存在等通常在运行时才检查。构建步骤若另行执行集成测试、迁移或依赖数据库的代码生成，才可能需要真实依赖。
+
+## 27. 当前 Dockerfile 的多阶段构建
+
+当前文件位于 day9/Dockerfile，构建上下文应为模块根目录 cloudtask-go。去除教学注释后的主要内容：
+
+```dockerfile
+FROM golang:1.26 AS builder
+WORKDIR /cloudtask
+
+COPY go.mod go.sum ./
+RUN GOPROXY=https://goproxy.cn,direct go mod download
+
+COPY day9 /cloudtask/day9/
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/cloudtask-api ./day9/cmd/server
+
+FROM alpine:3.23 AS runtime
+RUN apk add --no-cache ca-certificates
+WORKDIR /app
+COPY --from=builder /out/cloudtask-api /app/cloudtask-api
+CMD ["/app/cloudtask-api"]
+```
+
+### 27.1 两个阶段都属于镜像构建
+
+```text
+源码 → builder：下载依赖、编译
+                ↓ /out/cloudtask-api
+       runtime：复制程序、记录启动命令
+                ↓
+       最终镜像 cloudtask-api:dev
+                ↓ 创建并启动容器
+       执行 /app/cloudtask-api，读取运行配置
+```
+
+不是要长期运行 builder、runtime 两个业务容器。Runtime 阶段也不再次编译：RUN 安装证书发生在构建时，CMD 的 API 启动命令发生在容器启动时。
+
+默认构建最终阶段，只把最终阶段所需的内容放进运行镜像。编译器、依赖源码和缓存仍可能保留在本机构建缓存中，但不会自动进入最终镜像。所需的 Go 依赖代码通常已经链接进二进制，不是程序运行时完全没有依赖。
+
+可以用两个 Dockerfile 分开构建，但需额外安排编译结果的导出和传递；单个多阶段文件通过 COPY --from 自动衔接。
+
+### 27.2 指令、工作目录与路径
+
+| 指令或路径 | 含义 |
+| --- | --- |
+| FROM ... AS builder | 开始阶段并命名，供后续引用 |
+| WORKDIR /cloudtask | 设置当前阶段工作目录，不存在时创建 |
+| RUN ... | 构建镜像时执行命令 |
+| COPY go.mod go.sum ./ | 从构建上下文根目录复制到当前阶段的工作目录 |
+| COPY day9 /cloudtask/day9/ | 复制 day9 的内容，保留模块内的 day9 层级 |
+| COPY --from=builder ... | 从 builder 的文件系统复制产物，源路径从该阶段根目录解析 |
+| CMD / ENTRYPOINT | 配置容器启动行为，构建时不启动 API |
+
+`./` 是当前目录的写法，但参照点取决于位置：普通 COPY 的源相对于构建上下文；相对目标相对于 WORKDIR；RUN 中的相对路径通常相对于该命令的工作目录。WORKDIR 不改变 Docker 在宿主机构建上下文中寻找源文件的位置。
+
+曾把工作目录改成 /cloudtask，却仍把 go.mod 放到 /cloudtask/day9，导致下载依赖的位置不匹配。当前 Module 文件位于 /cloudtask，入口位于 /cloudtask/day9/cmd/server，与模块导入路径一致。
+
+### 27.3 编译变量和输出参数
+
+```text
+CGO_ENABLED=0       禁用 Go 与 C 代码交互的机制，不是简单地“不编译 C++”
+GOOS=linux          目标操作系统为 Linux
+-o /out/cloudtask-api    输出文件：cloudtask-api
+./day9/cmd/server        输入入口包：server 目录
+```
+
+变量名是 CGO_ENABLED，最后有 D。支持纯 Go 构建的依赖通常可以借此避免系统 C 动态库依赖；必须使用 CGO 的依赖可能无法构建或缺少相应功能。CPU 架构另由 GOARCH 控制。前缀变量只作用于这条 RUN 命令，不等于用 ENV 持续设置后续步骤。
+
+### 27.4 CMD、ENTRYPOINT 与信号
+
+当前使用 CMD 的 JSON 数组形式即可启动服务，不必仅为学习 ENTRYPOINT 而修改。
+
+- CMD 提供默认命令；docker run 镜像名 后的其他命令可替换它。
+- exec 形式的 ENTRYPOINT 指定主程序；运行时传入的参数追加给它，CMD 可提供默认参数；更换主程序可使用 --entrypoint。
+- JSON 数组形式直接执行程序，不额外经过 /bin/sh -c；参数边界明确，应用通常成为 PID 1，直接接收 SIGTERM，有利于当前 API 的优雅退出逻辑。
+- shell 形式可能由 shell 占据 PID 1，影响信号转发。exec 形式也不会自动展开 $变量、管道或重定向。
+
+## 28. Go Module、Docker Build Cache 与下载失败排查
+
+go.mod 声明模块路径、Go 版本要求、依赖版本要求及 replace 等规则；go.sum 记录依赖模块内容的校验和。go.sum 不保存依赖源码，也不是严格的版本锁文件。两者都应提交 Git。
+
+Docker 会按构建指令及相关输入查找可复用结果；COPY 涉及的文件改变，会影响该步骤及依赖它的后续步骤。因此先复制 Module 文件、下载依赖，再复制业务代码：
+
+```text
+只修改业务代码：Module COPY 与依赖下载通常复用缓存 → 重新复制源码和编译
+修改 Module 文件：相关 COPY 缓存失效 → 重新下载依赖和编译
+```
+
+这不只是缓存下载文件，还可以直接跳过已命中的 RUN 步骤。远程内容更新不会自动使相同 RUN 指令的已有缓存失效。缓存影响效率，不保证首次构建不需要联网。
+
+本次构建曾在 go mod download 失败：
+
+```text
+Get https://proxy.golang.org/...: dial tcp ...:443: connect: connection refused
+```
+
+已解析出地址，但到依赖服务器的 TCP 连接失败；尚未执行 go build，不能据此判断源码错误。Docker 镜像仓库、Go Module 代理和 Alpine 软件仓库是不同的下载来源，镜像下载成功不意味着依赖下载也能成功。
+
+当前改为在下载指令前指定 GOPROXY=https://goproxy.cn,direct，之后用户反馈构建成功。GOPROXY 是 Go 模块代理，不是 Docker 镜像仓库，也不是通用 HTTP 代理。逗号分隔时通常仅在前一源返回 404/410 后回退；direct 不保证连接被拒绝时自动兜底。
+
+本机 Go 配置和依赖缓存不会自动进入 builder。若其他环境仍失败，应根据新日志检查网络、Docker 构建代理或目标服务，而不是关闭依赖校验。当前配置没有禁用 GOSUMDB。
+
+## 29. 构建、运行与验证命令
+
+以下均从 cloudtask-go 目录执行；示例只说明操作步骤，不表示本次笔记整理重新执行了部署。
+
+```powershell
+# 读取指定文件和环境配置，仅校验，不启动容器
+docker compose --env-file day9/.env -f day9/docker-compose.yml config --quiet
+
+# 只验证 builder 阶段；要求能下载依赖
+docker build --target builder -f day9/Dockerfile -t cloudtask-builder .
+
+# 构建最终镜像
+docker build -f day9/Dockerfile -t cloudtask-api:dev .
+
+# 展开构建日志，便于排查
+docker build --progress=plain -f day9/Dockerfile -t cloudtask-api:dev .
+```
+
+- -f 指定 Dockerfile；-t 指定镜像名和标签；最后的 . 指定构建上下文，不能省略。
+- dev 是普通标签，不会自动启用开发模式；本地重新构建同标签不会自动更新已运行的容器。
+- config --quiet 成功时通常无输出，失败时有错误；不代表端口空闲、数据库可达或应用已就绪。
+- 当前 Compose 的 api 只有 image，没有 build；compose up 不会自动按 Dockerfile 构建 API，需要先 docker build。
+
+依赖就绪、迁移完成、配置备妥后：
+
+```powershell
+docker compose -f day9/docker-compose.yml up -d db redis
+docker compose -f day9/docker-compose.yml exec db pg_isready -U app -d cloudtask
+# 确认数据库、Redis 就绪，并完成必要迁移后启动 API
+docker compose -f day9/docker-compose.yml up -d api
+docker compose -f day9/docker-compose.yml ps -a
+docker compose -f day9/docker-compose.yml logs -f --tail 50 api
+```
+
+重新构建同标签镜像后，可以明确重建 API 容器以采用新镜像和配置：
+
+```powershell
+docker compose -f day9/docker-compose.yml up -d --force-recreate api
+```
+
+Ctrl+C 退出 logs -f 只停止查看日志。查看最近十分钟依赖日志可使用 `logs --since 10m db redis`，--tail 的行数按每个容器计算。读日志先看来源、时间、事件和上下文，再确认是否恢复；不要仅凭 FATAL 就认定数据库崩溃。
+
+API 验证：
+
+```powershell
+curl.exe -i http://127.0.0.1:8080/healthz
+curl.exe -i http://127.0.0.1:8080/readyz
+curl.exe -i http://127.0.0.1:8080/tasks
+```
+
+构建成功只表示镜像完成；运行时还可能因配置、认证、数据库不可达、缺表、监听端口冲突等失败。当前 /readyz 的 Ping 通过也不能证明所有迁移已经应用，需要业务接口和结构检查进一步验证。
+
+## 30. Compose 运行配置与敏感信息边界
+
+当前 api 服务配置：
+
+```yaml
+  api:
+    image: cloudtask-api:dev
+    env_file:
+      - .env.docker
+    ports:
+      - "127.0.0.1:8080:8080"
+```
+
+env_file 的路径相对于 Compose 文件，所以读取 day9/.env.docker。它将值放进容器环境变量，不等于把文件复制进镜像。config.Load 允许 day9/.env 不存在，再从环境读取，因此 /app 下无须准备这个文件。
+
+首次从 .env 复制为 .env.docker 时，应确认目标文件不存在再操作，避免覆盖已有配置。保留实际凭据并改为容器地址：DATABASE_URL 中主机使用 db，REDIS_ADDR 使用 redis:6379，HTTP_ADDR 使用 :8080。敏感值不在本文展示。
+
+必须区分两层配置：
+
+| 配置位置 | 用途 |
+| --- | --- |
+| Compose 默认 .env 或命令行 --env-file | 为 YAML 中的 ${POSTGRES_PASSWORD}、${REDIS_PASSWORD} 等变量做替换 |
+| api.env_file 或 api.environment | 显式提供给 API 容器的进程环境 |
+
+仅填写 .env.docker 不会自动改变 db、redis 的配置。两侧实际凭据必须一致；修改 PostgreSQL 环境变量也不会自动重设已有卷中用户的密码。
+
+当前 api 未配置 depends_on、healthcheck，db 也未配置 healthcheck；Redis 有 PING 健康检查。这意味着一次 up 全部服务不会自动等待数据库就绪。后续可补依赖健康条件和 API 就绪检查，但仅依赖启动顺序也不能替代运行时重连策略。
+
+## 31. 迁移文件、数据搬迁与交付
+
+### 31.1 API 镜像是否需要 migrations
+
+当前启动代码未执行迁移，也未读取迁移目录；所以 Runtime 仅复制二进制，暂不需要复制 migrations。把 SQL 放进镜像不会自动执行。迁移工具若在宿主机或独立迁移容器运行，应在对应环境提供迁移文件。
+
+### 31.2 新部署与数据搬迁是两件事
+
+| 目的 | 处理方式 |
+| --- | --- |
+| 新用户从空库开始 | 启动数据库 → 执行版本化迁移 → 可选演示数据 → 启动 API |
+| 换电脑保留现有数据 | 备份原数据库 → 传输备份 → 在新环境恢复 → 验证迁移版本和业务数据 → 启动 API |
+
+Compose 会重建服务和网络，不会跨电脑传输 Volume。相同卷名也不代表两台电脑共享数据。
+
+下面以 day9 目录、用户 app、数据库 cloudtask 为例。先在旧电脑备份：
+
+```powershell
+docker compose exec db pg_dump -U app -d cloudtask -Fc -f /tmp/cloudtask.dump
+docker compose cp db:/tmp/cloudtask.dump ./cloudtask.dump
+```
+
+传输备份后，在新环境启动并等待数据库就绪，再向没有业务表的目标库恢复：
+
+```powershell
+docker compose cp ./cloudtask.dump db:/tmp/cloudtask.dump
+docker compose exec db pg_restore -U app -d cloudtask --no-owner --no-privileges --exit-on-error /tmp/cloudtask.dump
+```
+
+这是恢复示例，不是本次实际演练。完整备份通常包含 Schema 和数据，避免先迁移创建同名表再直接重复恢复；恢复失败时需检查是否部分完成，不要直接把目标认定为可用。pg_dump 不备份整个集群的角色等全局对象，新环境应另行准备用户与权限。复制文件避免了旧版 PowerShell 重定向二进制时的编码问题。
+
+### 31.3 交付材料
+
+源码交付包括源码、Module 文件、Dockerfile、.dockerignore、Compose、.env.example、迁移和 README。镜像交付可通过镜像仓库，或离线导出：
+
+```powershell
+docker save -o cloudtask-api-dev.tar cloudtask-api:dev
+# 接收方
+docker load -i cloudtask-api-dev.tar
+```
+
+API 镜像归档不含 PostgreSQL、Redis 镜像，不含数据卷。完全离线时需另外准备依赖镜像；需要现有业务数据时另外提供备份及恢复说明。实际密码由接收方在运行时配置，不写入 API 镜像。
+
+交付验收应使用独立项目名或隔离环境、空数据卷，按 README 从零走完构建、迁移、启动和接口检查，不以现有开发库恰好有表作为成功依据。
+
+## 32. GitHub 压缩包变大与忽略规则
+
+本次排查确认，提交 916a038 曾同时跟踪 server.exe、cloudtask-local.exe，每个 47,972,864 字节，约 45.75 MiB，未压缩合计约 91.5 MiB。它们是本地构建产物，是源码 ZIP 明显变大的主要来源；并不是 Docker 镜像或数据卷自动进入仓库。
+
+5b8030a 已停止跟踪这两个文件和 day9/.env.docker。本地文件仍可保留，原提交历史仍含旧内容。
+
+```powershell
+# 仅在仍被跟踪时使用；--cached 保留本地文件
+git rm --cached -- server.exe cloudtask-local.exe day9/.env.docker
+```
+
+当前有一个范围问题：*.exe 等规则被写在 day9/.gitignore，只作用于 day9 及其子目录，无法忽略仓库根目录的两个 exe。整理时 git status 仍将它们显示为未跟踪，后续 git add . 可能再次加入。
+
+建议在 cloudtask-go/.gitignore 增加覆盖整个仓库的规则（这是建议，本次仅改笔记）：
+
+```gitignore
+*.exe
+*.test
+coverage.out
+*.zip
+*.dump
+.env
+.env.*
+!.env.example
+```
+
+与 Git 规则分别管理的 .dockerignore，也可补 *.exe 等本地构建产物规则。现有 Dockerfile 只复制 day9 和 Module 文件，根目录 exe 不会被该 COPY 带入镜像，但不应依赖这一点代替明确的忽略规则。
+
+停止跟踪后推送新提交，从最新提交下载源码 ZIP 会去掉这些文件；git clone 仍可能下载包含大文件的历史。若曾推送真实密码，应更换相关凭据，移出最新提交不能撤销泄露。历史重写是另一项操作，需单独规划，不作为清理源码 ZIP 的默认步骤。
+
+## 33. 提交规范与 CI/CD 的下一步
+
+提交描述应对应实际变更，可以使用以下类型：
+
+- feat：新增容器化部署等能力。
+- fix：修复配置路径、启动或测试问题。
+- chore：清理编译产物、完善忽略规则等维护。
+- docs：整理本文及使用说明。
+
+部署与工程规范若在同次变更中，可以共同描述；不要把项目已有功能重新列为本次新增，也不要用“已验证”描述仅讲解过的方案。
+
+接入流水线前应明确这些步骤各自的边界：
+
+```text
+代码检查、单元测试
+    → 构建 API 镜像
+    → 在独立数据库/Redis 环境执行迁移与集成验证
+    → 发布带版本标识的镜像
+    → 目标环境配置与迁移
+    → 启动并验证就绪、业务接口
+```
+
+这是后续路线，不代表当前已实现。单元测试应隔离开发机配置；需要真实服务的测试应单独准备依赖，不将数据库密码写进仓库或构建日志。生产运行数据不能随 CI 测试环境清理。
+
+## 34. 阶段状态、证据与后续待办（本轮完善前）
+
+截至本次整理，结合文件检查和用户反馈：
+
+| 项目 | 状态与依据 |
+| --- | --- |
+| Go 版本 | go.mod 声明 Go 1.26.0，builder 使用 golang:1.26 |
+| Docker 多阶段 | 文件已实现；用户反馈镜像构建成功 |
+| Compose API | 已添加 api，使用本地 cloudtask-api:dev；用户反馈 API 访问成功 |
+| 配置隔离 | API 从 .env.docker 注入；镜像只复制程序，.dockerignore 排除真实环境文件 |
+| 本机端口范围 | db、redis、api 的发布地址均为 127.0.0.1 |
+| PostgreSQL MinConns | 当前 database.go 已赋值，更新第 23 节的待核对记录 |
+| 就绪路由 | 当前 URL 是 /readyz，readySys 是 Go 方法名，修正前文将其混作 URL 的记录 |
+| Git 清理 | 5b8030a 已停止跟踪 exe 与 .env.docker；根目录忽略范围仍待完善 |
+| 自动化 CI/CD | 尚未发现实际工作流；本地构建和运行不等于自动化发布部署 |
+
+仍需处理或单独验证：
+
+- 根目录 .gitignore 缺失；当前本地 server.exe、cloudtask-local.exe、ZIP 仍显示为未跟踪，应防止再次提交。
+- 当前 config.go、config_test.go 有用户尚未提交的修改；本次不改动它们。测试辅助函数仍 t.Chdir(dir) 到临时 day9/internal/config，而 Load 读取 day9/.env；完整配置用例的 REDIS_ADDR 输入为 redis:6380，期望却为 localhost:6380，也需要对齐。本次没有执行测试，不能声称已修复或通过。
+- 根 README 仍提到 Go 1.25.7、首次启动自动执行旧 Schema，与当前 Go 1.26、独立迁移流程不一致，后续需同步。
+- 当前只完成本机容器化，尚需新环境空卷迁移、备份恢复、镜像交付和优雅退出的独立验收记录。
+- API/数据库健康检查及依赖就绪等待、结构化请求日志、ShutdownTimeout 配置化等仍是待办；第 23 节提到的布隆 Key 清理错误日志仍需修正。
+
+本次只更新本 Markdown 笔记，没有修改业务代码、Dockerfile、Compose 或忽略规则，没有构建/启动容器、迁移数据库、生成或恢复备份，也没有提交和推送 Git。
+
+参考：[Docker 多阶段构建](https://docs.docker.com/build/building/multi-stage/)、[Dockerfile 指令](https://docs.docker.com/reference/dockerfile/)、[构建缓存](https://docs.docker.com/build/cache/invalidation/)、[Compose 网络](https://docs.docker.com/compose/how-tos/networking/)、[Compose 环境变量注入](https://docs.docker.com/compose/how-tos/environment-variables/set-environment-variables/)、[数据卷](https://docs.docker.com/engine/storage/volumes/)、[Go CGO](https://pkg.go.dev/cmd/cgo)、[PostgreSQL pg_dump](https://www.postgresql.org/docs/17/app-pgdump.html)。
+
+## 35. 基础镜像、多阶段构建与产物位置
+
+补充日期：2026-11-16。本轮继续完善容器运行镜像，不代表已经接入自动化 CI/CD。
+
+### 35.1 Alpine、scratch、Debian Slim 的角色
+
+基础镜像提供程序运行需要的用户空间文件；Linux 内核由容器运行环境提供。Windows Docker Desktop 的 Linux 容器通常使用 WSL 2 或 Linux 虚拟机提供的内核。
+
+| 选择 | 特点 | 使用时需要注意 |
+| --- | --- | --- |
+| Alpine | 轻量发行版，包含 Shell、BusyBox 和 apk，使用 musl | 部分依赖 glibc 的动态链接程序不能直接使用 |
+| scratch | 空白构建起点，没有预置 Shell、包管理器和证书 | 必须自行提供程序及证书等所需文件 |
+| Debian Slim | Debian 精简镜像，使用 glibc，保留基础工具和包管理能力 | 通常比 Alpine 大，仍需按需安装运行依赖 |
+
+当前 API 使用 Alpine；Compose 中 redis:8-alpine 表示 Redis 自身基于 Alpine 打包。两个容器各有文件系统，不是共用一套 Alpine。生产镜像并非必须使用 Alpine，golang 镜像也能运行程序，但会携带运行时不需要的工具链等内容。
+
+### 35.2 本机 exe 与 builder 产物不是同一个文件
+
+| 路径 | 位置与来源 |
+| --- | --- |
+| cloudtask-local.exe | Windows 本机编译产物，不参与当前 Dockerfile 的编译 |
+| /out/cloudtask-api | builder 阶段内部生成的 Linux 程序 |
+| /app/cloudtask-api | runtime 阶段从 builder 复制得到的 Linux 程序 |
+
+```dockerfile
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/cloudtask-api ./day9/cmd/server
+COPY --from=builder /out/cloudtask-api /app/cloudtask-api
+```
+
+这里的绝对路径位于镜像构建环境内部，不会自动导出到 Windows 项目目录。最终镜像从 Alpine 重新开始，只选择性复制二进制，因此不自动继承 builder 的 Go 编译器、源码目录或依赖缓存。Go 运行时通常已经链接进二进制，不等于需要安装 Go 编译器。二进制仍可能保留函数名、源码路径或通过 go:embed 嵌入的资源，不能声称其中完全没有源码相关信息。
+
+## 36. 镜像大小检查、瘦身结果与构建缓存
+
+### 36.1 三条检查命令
+
+```powershell
+docker image ls cloudtask-api
+docker image inspect cloudtask-api:dev --format "{{.Size}}"
+docker history --no-trunc cloudtask-api:dev
+```
+
+- image ls：查看本地镜像概况；U 表示有容器引用，不代表容器一定正在运行。
+- image inspect：读取镜像详细配置；--format 使用模板提取字段，Size 单位为字节。
+- history：查看最终镜像的构建历史，最新步骤在上；--no-trunc 不截断命令和 ID。它不是完整文件清单，需结合 Dockerfile 或容器内检查确认内容。
+
+原镜像 history 中，复制程序约 47.7MB，Alpine 基础层约 9.08MB，安装证书的层约 1.22MB，WORKDIR 变化约 8.19kB。CMD 主要修改配置，显示 0B；底层 Alpine 的 CMD 被最终启动配置覆盖。历史中的 <missing> 是没有可显示的独立中间镜像 ID，不表示镜像损坏。
+
+用户当前 Docker 输出区分 CONTENT SIZE 和 DISK USAGE：前者为内容存储大小，主要是压缩层数据；后者还涉及解压后的数据。containerd 可以同时保留压缩内容和解压数据，因此不能将 history 的层大小、inspect 的 Size 和磁盘占用视为同一口径。本次 inspect 返回 26309216，与 CONTENT SIZE 26.3MB 对应；不能将此关系推广到所有版本及存储后端。不同镜像共享层时，各行占用也不能简单相加作为独占空间。
+
+### 36.2 编译参数与实际瘦身
+
+当前 Dockerfile 已改为：
+
+```dockerfile
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/cloudtask-api ./day9/cmd/server
+```
+
+环境变量放在 go build 前；-trimpath、-ldflags 是 go build 的参数，必须放在 go build 后。-trimpath 移除构建环境路径；-s、-w 省略符号表及 DWARF 调试信息，通常能减少体积，但降低二进制调试便利性，常规 panic 堆栈通常仍可显示函数和行号。
+
+用户提供的镜像对比：
+
+| 镜像 | ID | DISK USAGE | CONTENT SIZE |
+| --- | --- | --- | --- |
+| cloudtask-api:dev | 369357009b5b | 84.3MB | 26.3MB |
+| cloudtask-2.3-opt1:latest | bfc81c8d9336 | 58.7MB | 15.2MB |
+
+本地占用减少 25.6MB，约 30%；内容大小减少 11.1MB，约 42%。后续非 root 镜像中二进制大小为 33194146 字节，约 33.2MB / 31.7MiB。上述来自不同次输出，不应混作同一个镜像 ID 的测量。
+
+### 36.3 Tag、构建上下文和缓存
+
+在 cloudtask-go 目录构建示例：
+
+```powershell
+docker build --progress=plain -f day9/Dockerfile -t cloudtask-api:2.3.2-nonroot .
+```
+
+若在 day9 目录，则使用 -f Dockerfile，并将构建上下文设为 ..。否则 COPY go.mod、go.sum 或 day9 可能找不到源路径。此前曾询问“新 Tag 为什么构建失败”，但未提供当次完整命令与错误日志，不能把上下文问题认定为已证实的失败原因。
+
+更换 Tag 本身不使缓存失效。同名 Tag 构建成功后可以指向新镜像，旧镜像不会被原地修改，现有容器也不会自动换镜像；重启旧容器不能完成更新。cloudtask-2.3-opt1:latest 是新仓库名加默认 latest 标签；cloudtask-api:2.3-opt1 才是保留仓库名、改变标签。
+
+本轮改变 go build 指令会重新编译，前面未变化的 Module 下载步骤通常可复用。Dockerfile 位于 day9 内且 COPY day9 会复制它，因此修改 Dockerfile 也可能影响该 COPY 的缓存。构建输出中的 CACHED 表示复用成功。
+
+Build Cache 可能保留 builder 的源码、依赖和旧构建结果，即使最终运行镜像很小，本地缓存仍可能很大。清理缓存不会缩小已生成的镜像；docker build --no-cache 只要求重新构建。apk add --no-cache 是 apk 不保留包索引缓存，与 Docker 构建缓存不是一回事。
+
+## 37. 非 root 用户、UID/GID 与最小权限
+
+API 监听 8080、连接 PostgreSQL/Redis 等操作不需要 root。非 root 用户能限制程序被利用后修改容器内文件的能力，但不是完整安全隔离方案；容器内 root 也不等同于 Windows 管理员。
+
+当前运行阶段的关键配置：
+
+```dockerfile
+FROM alpine:3.23 AS runtime
+RUN apk add --no-cache ca-certificates
+RUN addgroup -S -g 10001 app && adduser -S -D -H -u 10001 -G app app
+WORKDIR /app
+COPY --from=builder --chown=0:0 --chmod=0555 /out/cloudtask-api /app/cloudtask-api
+USER 10001:10001
+CMD ["/app/cloudtask-api"]
+```
+
+- addgroup -S -g 10001 app：创建 GID 10001 的系统用户组。
+- adduser -S -D -H -u 10001 -G app app：创建 UID 10001、主组 app 的系统用户，不设置密码、不创建主目录。
+- USER：切换后续默认运行身份；只创建用户而不设置 USER，不会自动让程序使用新身份。
+- COPY 的 --chown=0:0 明确由 root:root 拥有，--chmod=0555 明确文件权限。
+
+不指定编号时通常是自动选取可用 UID/GID，不是随机抽取；基础镜像或创建顺序变化可能改变结果。Linux 文件权限依赖数字 UID/GID，固定编号有利于保持卷目录及部署配置一致。10001 是项目约定，没有特殊权限含义，也不会自动解决挂载目录权限问题。
+
+Config.User 输出 10001:10001 正常，因为镜像记录的是 USER 指令配置的值，不会自动转换成 app:app。用户名与编号通过镜像中的用户数据库对应。
+
+## 38. 文件所有者、目录权限与验证结果
+
+### 38.1 构建时放文件与运行时写文件的区别
+
+app 用户与 /app 目录只是同名，没有自动归属关系。COPY 在构建时向镜像放入程序；运行时 app 只执行已存在的程序，不需要再次写入该文件。当前程序不需要往 /app 写文件，因而目录和二进制均由 root 拥有。以后若需要文件输出，应按需准备单独可写目录。
+
+权限分为所有者、所属组、其他用户，Linux 根据访问者身份依次匹配一组，不会将三组权限相加。文件 root:root 中，第一个 root 是所有者用户，第二个 root 是所属用户组；app 既不是所有者也不属于 root 组，因此使用“其他用户”权限。
+
+```text
+r = 4，w = 2，x = 1
+7 = 4 + 2 + 1 = rwx
+5 = 4 + 0 + 1 = r-x
+0555 → r-x r-x r-x
+0755 → rwx r-x r-x
+```
+
+前导 0 表示未设置特殊权限位，0555 与通常说的 555 权限相同。普通文件的 r/w/x 是读取、修改、执行；目录的 r 是列出名字，x 是进入和访问内部条目，w 配合 x 允许创建、删除、重命名条目。
+
+| 对象 | 所有者 | 权限 | app 的能力 |
+| --- | --- | --- | --- |
+| /app | root:root | 0755 | 可以列出、进入，但不能新增、删除或重命名条目 |
+| /app/cloudtask-api | root:root | 0555 | 可以读取、执行，不能直接修改 |
+
+文件不可写不代表一定不可删除：删除主要取决于父目录权限。因此需同时限制 /app 的写权限。0555 不意味着 root 永远不能修改文件，root 通常可以修改权限或绕过部分检查。
+
+### 38.2 用户实际提供的验证结果
+
+```powershell
+docker image inspect cloudtask-api:2.3.2-nonroot --format "{{.Config.User}}"
+docker run --rm --entrypoint /bin/sh cloudtask-api:2.3.2-nonroot -c "id; ls -ld /app; ls -l /app"
+```
+
+```text
+10001:10001
+uid=10001(app) gid=10001(app) groups=10001(app)
+drwxr-xr-x    1 root root     4096 Nov 16 12:24 /app
+total 32420
+-r-xr-xr-x    1 root root 33194146 Nov 16 12:24 cloudtask-api
+```
+
+已确认非 root 身份、root 所有权、目录 0755 和二进制 0555。ls 中的 1 是硬链接数，不是文件数量；OverlayFS 等文件系统对目录链接数可能有特殊统计，不能据此推算子目录数量。4096 是目录自身大小，不是内容总大小；total 是条目磁盘块占用汇总，不是文件数量。日期是文件系统修改时间，不是容器启动时间。
+
+- ls -ld /app：-d 表示检查目录本身。
+- ls -l /app：列出目录内非隐藏条目的详细信息，并非专门识别二进制。
+- ls -l /app/cloudtask-api：明确检查指定文件。
+- 分号依次执行命令，前一条失败仍会继续；整段退出状态通常是最后一条命令的状态。
+
+此前 command -v wget 输出 /usr/bin/wget，只能证明 PATH 中能找到命令，未证明网络畅通。--entrypoint /bin/sh 替换了默认启动方式，上述检查没有启动 Go API；--rm 在进程退出后删除临时容器，镜像保留。
+
+## 39. Compose 网络与手动启动非 root 镜像
+
+用户 docker network ls 显示 bridge、day9_default、host 和 none。NETWORK ID 是标识，DRIVER 是驱动，SCOPE local 指当前 Docker 主机范围，不代表公网范围。
+
+| 网络 | 用途 |
+| --- | --- |
+| bridge | 未指定其他网络时普通 Linux 容器通常使用的默认桥接网络 |
+| day9_default | Compose 项目创建的桥接网络，服务可通过 db、redis 等名称互相发现 |
+| host | 共享 Docker 主机的网络命名空间；Docker Desktop 支持方式依赖平台及配置 |
+| none / null | 通常只保留回环接口，不提供普通外部网络连接 |
+
+网络存在不证明依赖容器已接入或就绪，可以通过 docker network inspect day9_default 检查成员。API 容器的 localhost 指向自身，连接其他容器应使用 db:5432 和 redis:6379。
+
+在 cloudtask-go 目录手动启动的命令：
+
+```powershell
+docker run --rm `
+  --name cloudtask-api-nonroot `
+  --network day9_default `
+  -p 127.0.0.1:18080:8080 `
+  --env-file .\day9\.env.docker `
+  cloudtask-api:2.3.2-nonroot
+```
+
+此命令启动镜像的默认 API 程序；18080 是 Windows 本机访问端口，8080 是容器监听端口。只发布到 127.0.0.1，供本机访问。--network 让手动启动的容器加入已有 Compose 网络，不负责启动数据库和 Redis。PowerShell 续行符是反引号，必须放在行尾，不应在其后添加空格。
+
+## 40. 故障排查：docker run 的环境文件引号导致连接 Unix socket
+
+### 40.1 现象与证据
+
+上述手动启动失败，关键错误（省略日志时间等字段）：
+
+```text
+数据库加载或连接失败：Unable to ping database:
+failed to connect to `user=app database=`:
+/tmp/.s.PGSQL.5432 (/tmp): dial error:
+dial unix /tmp/.s.PGSQL.5432: connect: no such file or directory
+```
+
+程序尝试连接 API 容器自身的 PostgreSQL Unix socket，而非预期的 db:5432。此错误本身不能证明数据库容器未启动，也不是 /app 权限不足造成的。
+
+本轮检查发现：
+
+1. config.Load 直接通过 os.Getenv("DATABASE_URL") 读取 DSN，未去除外层引号。
+2. database.NewDBPool 将其传给 pgxpool.ParseConfig，再创建连接池并 Ping。
+3. 本地 .env.docker 的 DATABASE_URL 带有外层双引号。
+4. 使用同一镜像及 --env-file 启动临时 Shell，仅检查是否以双引号开头，实际输出为 yes，确认引号被保留。检查未打印连接字符串或密码，也未启动 API。
+
+### 40.2 根因与处理方式
+
+docker run --env-file 与 Compose 默认 env_file 的解析规则不同。Compose 会处理外层引号；docker run 会将这种外层引号保留在环境变量值中。DSN 因此不再以 postgres:// 直接开头，未按预期 URI 解析，导致主机、数据库名等配置异常，并回退到本地 Unix socket 连接。
+
+错误中的 user=app 不能单独证明数据库用户解析正确：它也可能来自当前 Linux 用户 app；database= 为空是另一条异常线索。
+
+修改建议如下，密码仅为占位符，不代表实际凭据：
+
+```dotenv
+# 修改前
+DATABASE_URL="postgres://app:YOUR_PASSWORD@db:5432/cloudtask?sslmode=disable"
+
+# 修改后：只去掉最外层双引号，保留实际连接信息
+DATABASE_URL=postgres://app:YOUR_PASSWORD@db:5432/cloudtask?sslmode=disable
+```
+
+其他用于 docker run --env-file 的值也应检查是否含不期望的外层引号。不要盲目删除密码内部的引号或其他字符；URI 密码中的保留字符应按 URI 规则编码，也不能假设该文件支持 Compose 的变量插值。
+
+环境文件是在启动时读取的，修改后重新创建容器即可，不需要重建镜像。本轮尚无去引号后成功启动及业务接口验证的记录，不能将“根因定位”写成“恢复已验证”。
+
+参考：[Docker run](https://docs.docker.com/reference/cli/docker/container/run/)、[Compose env_file](https://docs.docker.com/reference/compose-file/services/#env_file)、[Docker CLI 引号行为记录](https://github.com/docker/cli/issues/4665)。
+
+## 41. 本轮最新状态与后续验收
+
+| 项目 | 当前结论与证据 |
+| --- | --- |
+| 编译瘦身 | 当前 Dockerfile 已有 -trimpath 和 -ldflags="-s -w"；用户提供了优化前后镜像大小对比 |
+| 非 root 运行 | 当前 Dockerfile 使用 USER 10001:10001；用户的 id 输出已确认 app 身份 |
+| 二进制权限 | 当前 COPY 明确 root:root、0555；用户 ls 输出已确认 |
+| /app 权限 | 用户 ls 输出确认 root:root、0755，app 可访问不可写；当前 Dockerfile 依赖 WORKDIR 创建目录的默认权限 |
+| 非 root API 启动 | 实际启动在数据库 Ping 阶段失败，尚未完成接口验收 |
+| 环境文件故障 | 已确认 docker run 保留 DSN 外层双引号；已给出移除建议，未记录修改后恢复结果 |
+| 原有 Compose | 历史上 API 访问成功不等于新非 root 镜像也已通过；原 api 镜像引用需另行核对更新 |
+| 自动化 CI/CD | 本轮未新增流水线、镜像发布或远程部署 |
+
+接下来应先按第 40 节调整运行环境文件，确认 db、redis 已在 day9_default 中运行，再重新创建非 root API 容器。启动成功后检查 /readyz 及实际业务接口，记录数据库和 Redis 访问是否正常；就绪检查不能替代迁移结构及业务验证。如改由 Compose 启动新镜像，应显式更新 api 的 image 引用并重建容器。
+
+第 34 节关于 Git 忽略规则、配置测试、README、独立迁移/备份恢复验收等未完成事项仍保留，未因本轮镜像完善而自动完成。此次整理只编辑本文，保留用户已有的 Dockerfile 与业务文件修改；没有替用户更改环境文件、重新构建镜像、启动业务服务或执行数据库操作，没有提交和推送 Git。此前故障排查只额外运行过一个临时 Shell 容器验证引号行为。
