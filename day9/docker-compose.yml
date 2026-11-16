@@ -7,7 +7,8 @@ services:
       POSTGRES_USER: app
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dev_password_only_local}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
+        #宿主机ip   宿主机端口  容器端口
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
@@ -34,6 +35,14 @@ services:
       timeout: 3s
       retries: 5
       start_period: 5s
+  
+
+  api:
+    image: cloudtask-api:dev
+    env_file:
+      - .env.docker
+    ports:
+      - "127.0.0.1:8080:8080"
 
 volumes:
       postgres_data:

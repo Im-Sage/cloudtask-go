@@ -18,6 +18,7 @@ func NewDBPool(ctx context.Context, cfg config.PostgresConfig) (*pgxpool.Pool, e
 	}
 
 	poolConfig.MaxConns = cfg.MaxConns
+	poolConfig.MinConns = cfg.MinConns
 	// 使用配置文件创建连接池
 	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {

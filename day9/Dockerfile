@@ -1,0 +1,35 @@
+# 选择go镜像并命名阶段
+FROM golang:1.26 AS builder
+# 设置工作目录(这个目录是在镜像内部) 
+# mkdir -p /cloudtask/day9
+# cd /cloudtask/day9
+# WORKDIR /cloudtask/day9
+WORKDIR /cloudtask
+#复制Module文件
+COPY go.mod go.sum ./
+# 下载依赖
+RUN GOPROXY=https://goproxy.cn,direct go mod download
+#复制整个day9中源码
+COPY day9 /cloudtask/day9/
+#编译Linux程序并明确输出位置
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/cloudtask-api ./day9/cmd/server
+
+# 运行阶段 
+# alpine是一个独立的基础镜像
+# 提供基本的Linux环境，不包含Go编译器
+FROM alpine:3.23 AS runtime
+
+# 如需验证HTTPS或数据库TLS证书，安装CA证书
+RUN apk add --no-cache ca-certificates
+
+# 设置运行阶段的自己的工作目录
+WORKDIR /app
+
+# 复制编译阶段的builder的可执行二进制文件
+# COPY --from 的源路径从指定阶段的文件系统根目录开始解析
+# /out/cloudtask-api是构建阶段的输出文件
+# /app/cloudtask-api属于新的 Runtime 阶段。
+COPY --from=builder /out/cloudtask-api /app/cloudtask-api
+
+# 配置API的启动命令
+CMD [ "/app/cloudtask-api" ]

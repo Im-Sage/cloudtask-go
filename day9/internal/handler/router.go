@@ -16,7 +16,7 @@ func NewRouter(taskService *service.TaskService, pool *pgxpool.Pool) *gin.Engine
 
 	router.GET("/healthz", taskHandler.healthzSys)
 
-	router.GET("/readySys", healthHandler.readySys)
+	router.GET("/readyz", healthHandler.readySys)
 
 
 	router.POST("/tasks", taskHandler.CreateTask)
