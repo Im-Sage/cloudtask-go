@@ -1446,3 +1446,309 @@ DATABASE_URL=postgres://app:YOUR_PASSWORD@db:5432/cloudtask?sslmode=disable
 接下来应先按第 40 节调整运行环境文件，确认 db、redis 已在 day9_default 中运行，再重新创建非 root API 容器。启动成功后检查 /readyz 及实际业务接口，记录数据库和 Redis 访问是否正常；就绪检查不能替代迁移结构及业务验证。如改由 Compose 启动新镜像，应显式更新 api 的 image 引用并重建容器。
 
 第 34 节关于 Git 忽略规则、配置测试、README、独立迁移/备份恢复验收等未完成事项仍保留，未因本轮镜像完善而自动完成。此次整理只编辑本文，保留用户已有的 Dockerfile 与业务文件修改；没有替用户更改环境文件、重新构建镜像、启动业务服务或执行数据库操作，没有提交和推送 Git。此前故障排查只额外运行过一个临时 Shell 容器验证引号行为。
+
+## 42. 健康检查阶段：目标与实际配置（2026-11-17）
+
+本阶段为 API 镜像增加 HEALTHCHECK，为 PostgreSQL 增加 Compose 健康检查，并让 API 在启动时等待 PostgreSQL 健康。以下是本次整理时的实际文件状态，后文另列建议，避免将建议写成已经实施的改动。
+
+### 42.1 API 镜像的健康检查
+
+Dockerfile 的 runtime 阶段安装 ca-certificates 和 curl，且安装发生在 USER 10001:10001 之前：
+
+```dockerfile
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories && \
+    apk add --no-cache ca-certificates curl
+```
+
+当前使用阿里云 Alpine 镜像源，保留原仓库路径和版本。此调整与本阶段遇到的默认软件源访问失败有关，但不能仅凭构建成功证明此前网络异常的具体原因。
+
+API 检查放在 Dockerfile 的启动 CMD 之前：
+
+```dockerfile
+USER 10001:10001
+
+HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 CMD curl -fsS --max-time 2 http://127.0.0.1:8080/readyz || exit 1
+
+CMD ["/app/cloudtask-api"]
+```
+
+注意：当前实际参数为 timeout=30s、start-period=5s；相邻注释写的是 start-period=2s，与实际配置不一致，仍待修正。curl 已将请求限制为 2 秒，Docker 的 timeout 可以考虑设为 3 秒；考虑 API 启动时还需初始化连接池、构建布隆过滤器，start-period 可先考虑 20 秒，再按实际启动耗时调整。以下仅为建议，本次整理没有修改 Dockerfile：
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \
+    CMD curl -fsS --max-time 2 http://127.0.0.1:8080/readyz || exit 1
+```
+
+### 42.2 PostgreSQL 健康检查与 API 启动依赖
+
+在 docker-compose.yml 的 db 下配置，与 environment、ports、volumes 同级：
+
+```yaml
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'pg_isready -h 127.0.0.1 -p 5432 -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -t 2'
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+```
+
+API 使用包含健康检查的新镜像，并等待 db 健康：
+
+```yaml
+  api:
+    image: cloudtask-api:2.3.3-health
+    env_file:
+      - .env.docker
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+```
+
+## 43. 健康检查命令、网络与环境变量
+
+### 43.1 curl 命令逐项解释
+
+```sh
+curl -fsS --max-time 2 http://127.0.0.1:8080/readyz || exit 1
+```
+
+| 部分 | 作用 |
+| --- | --- |
+| curl | 发起 HTTP 请求，默认使用 GET |
+| -f | HTTP 400 及以上状态码使命令失败 |
+| -s | 隐藏进度条与普通错误提示 |
+| -S | 配合 -s，在失败时仍输出错误信息 |
+| --max-time 2 | 整个请求最多运行 2 秒 |
+| 127.0.0.1:8080/readyz | 访问当前 API 容器自身的就绪接口 |
+| \|\| exit 1 | curl 失败时，统一返回退出码 1 |
+
+HEALTHCHECK 后的 CMD 指定检查命令；Dockerfile 独立的 CMD 指定容器默认启动命令。不要把检查命令单独写成新的 Dockerfile CMD，否则会替换启动 API 的 CMD。
+
+URL 应写为 http://，不需要在冒号后添加反斜杠。PowerShell 的 curl.exe -i 中，-i 表示同时显示 HTTP 响应头，和容器内健康检查中的 -f 作用不同。
+
+### 43.2 /readyz 与 pg_isready 是两条检查路径
+
+在 Windows 上执行：
+
+```powershell
+curl.exe -i http://127.0.0.1:8080/readyz
+```
+
+执行路径如下，不会调用 pg_isready：
+
+```text
+Windows curl.exe → 宿主机 8080 → 端口映射 → API 的 /readyz
+    → pool.Ping(ctx) → PostgreSQL → HTTP 200 或 503
+```
+
+当前 readySys 复用启动时创建的连接池，给 Ping 设置 1 秒超时；成功返回 200/ready，失败返回 503/not_ready。/healthz 仅返回 HTTP 200，确认 HTTP 服务可以响应。/readyz 当前主要检查 PostgreSQL，不检查 Redis，也不检查业务表是否存在。
+
+pg_isready 则由 Docker 按 db.healthcheck 定时触发，在 PostgreSQL 容器内部执行：
+
+```text
+Docker → db 容器的 /bin/sh -c → 展开环境变量 → pg_isready
+    → 检查本容器 PostgreSQL 是否接受连接 → 返回退出码
+```
+
+pg_isready 由当前 PostgreSQL 官方镜像提供。参数 -U 指定用户名，-d 指定数据库，-h/-p 指定连接地址与端口，-t 2 表示连接检查最多等待 2 秒。
+
+| pg_isready 退出码 | 含义 |
+| --- | --- |
+| 0 | 服务器正在接受连接 |
+| 1 | 服务器正在拒绝连接，例如仍处于启动阶段 |
+| 2 | 服务器没有响应 |
+| 3 | 未发起检查，例如参数无效 |
+
+pg_isready 不保证密码正确、业务表存在或业务 SQL 正常；用户名或数据库名错误也不一定影响它判断服务器正在接受连接。使用正确参数可避免无意义的连接失败日志。API 使用自己的连接配置执行 Ping，因此数据库 healthy 并不保证 API 一定 healthy。
+
+### 43.3 为什么检查自身用 127.0.0.1，API 连接数据库用 db
+
+每个容器都有自己的回环地址：
+
+| 发起位置 | 访问地址 | 目标 |
+| --- | --- | --- |
+| PostgreSQL 容器内的 pg_isready | 127.0.0.1:5432 | 自己的 PostgreSQL |
+| API 容器内的 curl | 127.0.0.1:8080 | 自己的 HTTP 服务 |
+| API 的数据库连接 | db:5432 | Compose 网络中的 PostgreSQL 服务 |
+| Windows curl.exe | 127.0.0.1:8080 | 宿主机发布端口，再映射至 API |
+
+PostgreSQL 检查自身时，写 db 通常也能连通，但需要服务名解析并通过容器网络地址访问；127.0.0.1 更直接。API 容器里的 127.0.0.1 指向 API 自己，不能用它连接另一个数据库容器。
+
+### 43.4 为什么 Compose 中使用 $$
+
+```text
+YAML 中 $$POSTGRES_USER
+    → Compose 保留为字面量 $POSTGRES_USER
+    → CMD-SHELL 启动的容器 shell 展开变量
+    → 读取 db.environment 中的 POSTGRES_USER
+```
+
+直接写 $POSTGRES_USER 会让 Compose 尝试从宿主机环境或 .env 提前替换；YAML 外层单引号不能替代 $$。
+
+在 day9 目录手动执行一次检查时，使用单个 $，因为命令直接交给容器 shell，不经过 Compose YAML 插值；PowerShell 外层单引号避免宿主机展开变量：
+
+```powershell
+docker compose exec db sh -c 'pg_isready -h 127.0.0.1 -p 5432 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t 2'
+```
+
+## 44. 阶段复习：状态、参数、依赖与恢复
+
+### 44.1 Up 与 healthy 的区别
+
+Up 表示容器正在运行、主进程尚未退出，是状态而非“启动”动作。healthy 表示配置的健康检查通过，能证明的范围取决于检查内容。Up (unhealthy) 完全可能：主进程还活着，但服务无法正常响应检查。
+
+### 44.2 HEALTHCHECK 的工作原理与参数
+
+Docker 定期在容器内部执行检查命令，根据命令退出结果及连续失败次数更新健康状态。初始状态是 starting；检查成功后变为 healthy；连续失败达到阈值后变为 unhealthy。unhealthy 后仍继续检查，后续一次成功即可恢复为 healthy。标准健康命令应返回 0 表示成功、1 表示失败，避免主动使用保留退出码 2；pg_isready 原生提供其自身的状态退出码。
+
+| 参数 | 准确含义 |
+| --- | --- |
+| interval | 正常检查阶段，上次检查结束到下次检查开始的间隔 |
+| timeout | 单次检查最长运行时间；超过后终止检查并记为失败 |
+| retries | 标记 unhealthy 所需的连续失败次数，不是额外重试次数或总检查次数 |
+| start_period | 启动宽限期，期间失败不计入连续失败次数 |
+
+start_period 内仍会执行检查；一旦提前成功，后续失败就开始正常计数。成功会清零连续失败计数。例如 retries=3 时，“失败、失败、成功、失败”不会被视为连续失败三次。支持 start_interval 的版本还可单独指定宽限期内的检查间隔。
+
+### 44.3 为什么 API 等待数据库健康
+
+数据库容器启动并不代表 PostgreSQL 初始化结束、可以接受连接。当前 API 启动会创建连接池、Ping 数据库并读取数据，过早启动可能直接失败；等待数据库健康可减少启动时序问题，但不能替代数据库迁移。
+
+| depends_on 条件 | 含义 |
+| --- | --- |
+| service_started | 依赖容器已启动，不等待健康检查通过 |
+| service_healthy | 依赖容器的健康检查已通过 |
+
+condition: service_healthy 是 Compose 内置的依赖条件名称，不需要定义同名函数。db.healthcheck 定义“如何检查”；Docker 执行检查并维护健康状态；Compose 根据该状态决定何时启动 API。未在 Compose 重复声明 API 的 healthcheck，也不影响 API 继承镜像中的检查。
+
+### 44.4 unhealthy 是否自动重启；数据库宕机后能否保证恢复
+
+普通 Docker/Compose 不会仅因 unhealthy 自动重启容器。健康检查负责记录状态；restart: unless-stopped 等重启策略主要在容器退出后决定是否重启。进程仍在运行但检查失败时，不会因此触发该重启策略。
+
+depends_on 用于启动时的依赖等待，不会持续监控并在数据库每次故障时自动停止、等待和重启 API。数据库意外退出后，现有 db 的 unless-stopped 策略可以尝试重启数据库；API 能否恢复取决于连接池重新建连、超时及错误处理等机制。
+
+```text
+数据库故障 → API 数据库请求失败 → /readyz 返回 503
+    → 连续检查失败，API 标记 unhealthy（主进程可能仍在运行）
+数据库恢复 → 若连接池重新建连成功，/readyz 返回 200
+    → 下次检查成功，API 恢复 healthy
+```
+
+这条路径是可能的恢复过程，不是本轮已完成的故障恢复测试。即使在 depends_on.db 下增加 restart: true，它主要响应显式 Compose 更新、重启依赖的操作，也不等于数据库意外退出并由运行时重启后会自动联动重启 API。健康状态本身也不自动保证流量被摘除。
+
+## 45. Dockerfile 与 Compose 中健康检查的区别
+
+| 对比 | Dockerfile HEALTHCHECK | Compose healthcheck |
+| --- | --- | --- |
+| 配置归属 | 镜像的默认配置 | 本次服务部署配置 |
+| 生效范围 | 使用镜像创建的容器默认继承 | 使用该 Compose 创建的服务容器 |
+| 修改后应用 | 重建镜像，再重建容器 | 重建对应服务容器；仅改检查配置无需重建镜像 |
+| 适用场景 | 给自己维护的 API 提供通用默认检查 | 调整部署参数，或为 PostgreSQL、Redis 等第三方镜像配置检查 |
+
+Compose 可以覆盖镜像的检查命令和参数，也可以用 healthcheck.disable: true 禁用。两者最终都在容器内部执行，不会同时成为两套独立检查；工具仍必须存在于镜像中，把 curl 命令移到 Compose 并不能省掉镜像内安装 curl 的步骤。
+
+例如只调整 API 启动宽限期，其余继续继承镜像默认值：
+
+```yaml
+  api:
+    image: cloudtask-api:2.3.3-health
+    healthcheck:
+      start_period: 60s
+```
+
+## 46. 本阶段故障排查记录
+
+### 46.1 Compose 的 interval 缺少单位
+
+曾写成 interval: 5，实际运行 docker compose config --quiet 报错：
+
+```text
+services.db.healthcheck.interval must be a string
+```
+
+已改为 interval: 5s。本次整理再次执行配置校验，退出码为 0。
+
+### 46.2 docker build 未连接到 Docker 引擎
+
+首次构建提示找不到 dockerDesktopLinuxEngine 命名管道，说明当时未连上 Docker Desktop 的 Linux 引擎。后一次日志已经进入构建流程，表明当时引擎连接问题已解决。
+
+Windows 上使用 Docker Desktop 提供本地引擎时，需要先启动 Desktop 并等待引擎就绪；窗口可以最小化，但后台需运行。docker CLI 是客户端，构建由后台构建引擎完成；若连接远程引擎或 WSL 内独立运行的 Docker Engine，则不要求本机 Desktop 运行。docker info 能显示 Server 信息可用于检查连接状态。
+
+### 46.3 Alpine 安装软件包时 I/O error
+
+用户提供的第二次构建日志中，Go 编译已完成，失败步骤为 apk add --no-cache ca-certificates curl，最早的明确错误为：
+
+```text
+fetching https://dl-cdn.alpinelinux.org/alpine/v3.23/main/x86_64/APKINDEX.tar.gz: I/O error
+```
+
+可确定当时软件源索引下载失败，但日志不足以区分代理、DNS、网络波动或源站异常。后续依赖选择失败及 masked in: --no-network 不能单独证明用户手动禁用了 Docker 网络。镜像拉取成功也不能证明 apk 的目标域名可访问。
+
+曾建议用独立容器缩小排查范围：
+
+```powershell
+docker run --rm alpine:3.23 sh -c 'apk add --no-cache ca-certificates curl'
+```
+
+普通容器测试与构建环境并非完全相同；若普通容器成功而构建持续失败，应继续比较构建代理和网络配置。当前 Dockerfile 已替换默认源为阿里云源，且新镜像现已存在；未保存该独立测试的执行结果，不能补写为已验证成功。
+
+### 46.4 inspect 的 State.Health 为 null
+
+当时实际检查发现：
+
+| 对象 | 检查结果 |
+| --- | --- |
+| day9-api-1 | 使用旧 cloudtask-api:dev，Config.Healthcheck 与 State.Health 均为 null |
+| cloudtask-api:2.3.3-health 镜像 | Config.Healthcheck 已包含 curl /readyz 命令 |
+
+根因是新镜像已构建，但旧容器仍使用原镜像。null 表示没有启用健康检查，并非检查失败。仅重新构建镜像、移动标签或 docker restart 都不会让已有容器自动换用新镜像，需更新 Compose 的 image 并重建容器。当前文件与容器均已改为 2.3.3-health。
+
+## 47. 常用命令与本轮验收边界
+
+以下命令统一在 cloudtask-go 目录运行，避免混淆构建上下文和 Compose 文件位置：
+
+```powershell
+# 构建 API 镜像，最后的 . 为 cloudtask-go 构建上下文
+docker build -f day9/Dockerfile -t cloudtask-api:2.3.3-health .
+
+# 校验 Compose；无输出且退出码为 0 表示通过
+docker compose -f day9/docker-compose.yml config --quiet
+
+# 应用整个项目的配置，并按依赖条件启动
+docker compose -f day9/docker-compose.yml up -d
+
+# 若依赖已就绪，只重建 API；--no-deps 不负责启动或等待依赖
+docker compose -f day9/docker-compose.yml up -d --no-deps --force-recreate api
+
+# 查看容器状态与健康检查详情
+docker compose -f day9/docker-compose.yml ps -a
+docker inspect --format '{{json .State.Health}}' day9-api-1
+docker inspect --format '{{json .State.Health}}' day9-db-1
+
+# 检查镜像中是否包含健康检查
+docker image inspect --format '{{json .Config.Healthcheck}}' cloudtask-api:2.3.3-health
+
+# 从宿主机访问 API 的数据库就绪检查
+curl.exe -i http://127.0.0.1:8080/readyz
+```
+
+PowerShell 不使用反斜杠作为续行符，命令末尾不要附加反斜杠。镜像标签需与 Compose 中的 image 一致。不要用 down -v 作为健康检查配置更新步骤，它会删除命名数据卷。
+
+本次整理时通过只读命令取得以下状态快照：
+
+| 对象 | 实际结果 | 能确认的范围 |
+| --- | --- | --- |
+| Compose 配置 | config --quiet 退出码 0 | 当前配置通过 Compose 校验 |
+| day9-api-1 | image=cloudtask-api:2.3.3-health，running，healthy | API 容器使用新镜像，最近健康检查通过 |
+| day9-db-1 | image=postgres:17，running，healthy | PostgreSQL 容器运行且检查通过 |
+| day9-redis-1 | image=redis:8-alpine，exited，健康字段保留 unhealthy | Redis 当前已退出；健康字段不代表它仍在执行检查 |
+
+因此可以确认 API 与 PostgreSQL 的健康检查已生效，不能据此宣称 Redis 或全部业务功能正常。本轮未调查 Redis 退出原因，也未执行数据库停机/恢复、业务表验证或完整业务回归；连接池故障恢复能力仍需单独验证。第 41 节为上一阶段历史快照，本节是本阶段新增状态，不抹去此前排错记录。
+
+本次笔记整理仅修改本文，没有更改 Dockerfile、Compose、环境文件或业务代码，没有构建镜像、启停服务、执行数据库写入或提交推送 Git。
+
+参考：[Docker HEALTHCHECK](https://docs.docker.com/reference/dockerfile/#healthcheck)、[Compose healthcheck](https://docs.docker.com/reference/compose-file/services/#healthcheck)、[Compose 启动依赖](https://docs.docker.com/compose/how-tos/startup-order/)、[pg_isready](https://www.postgresql.org/docs/17/app-pg-isready.html)、[构建与容器代理](https://docs.docker.com/engine/cli/proxy/)。

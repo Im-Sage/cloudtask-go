@@ -17,15 +17,14 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/cloudta
 
 
 
-
-
 # 运行阶段 
 # alpine是一个独立的基础镜像
 # 提供基本的Linux环境，不包含Go编译器
 FROM alpine:3.23 AS runtime
 
-# 如需验证HTTPS或数据库TLS证书，安装CA证书
-RUN apk add --no-cache ca-certificates
+# 如需验证HTTPS或数据库TLS证书，安装CA证书和url，安装软件需要root权限
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories && \
+    apk add --no-cache ca-certificates curl
 
 
 # 创建 app 用户组和用户
@@ -44,6 +43,11 @@ COPY --from=builder --chown=0:0 --chmod=0555 /out/cloudtask-api /app/cloudtask-a
 
 # 后续指令及容器默认进程使用此用户组中的用户，在此之前都是root
 USER 10001:10001
+
+
+# 增加HEALTHCHECK
+# --start-period=2s为启动宽限期，--retries=3连续失败3次，标记为unhealthy
+HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 CMD curl -fsS --max-time 2 http://127.0.0.1:8080/readyz || exit 1
 
 # 配置API的启动命令
 CMD [ "/app/cloudtask-api" ]
