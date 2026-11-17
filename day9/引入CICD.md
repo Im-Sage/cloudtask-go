@@ -2,7 +2,7 @@
 
 记录日期：2026-11-12。
 
-后续补充：2026-11-13，第 14～23 节记录迁移管理、备份恢复、日志、健康检查和优雅退出。2026-11-16，第 24～34 节补充项目工程规范、Docker 多阶段构建、Compose 运行、交付及 Git 管理；第 35～41 节补充镜像瘦身、非 root 运行、Linux 权限及 docker run 环境变量引号问题。前文保留当时的排查过程；最新实现进度与待办以第 41 节为准。
+后续补充：2026-11-13，第 14～23 节记录迁移管理、备份恢复、日志、健康检查和优雅退出。2026-11-16，第 24～34 节补充项目工程规范、Docker 多阶段构建、Compose 运行、交付及 Git 管理；第 35～41 节补充镜像瘦身、非 root 运行、Linux 权限及 docker run 环境变量引号问题。2026-11-17，第 42～47 节补充健康检查，第 48～53 节补充 API 容器安全配置、YAML 列表、Compose 构建、镜像标签与空间管理。前文保留当时的排查过程；最新配置核对结果与验收边界以第 53 节为准。
 
 最初主要完成 CI/CD 前的配置管理准备：将连接地址、连接池参数、超时等从启动代码中提取，通过环境变量加载到 Config，再传给各组件。近期已进一步完成 Docker 镜像构建与本机 Compose 运行；用户已反馈构建及 API 访问成功。这仍不代表 CI 流水线、镜像自动发布或远程自动部署已经完成。
 
@@ -1752,3 +1752,162 @@ PowerShell 不使用反斜杠作为续行符，命令末尾不要附加反斜杠
 本次笔记整理仅修改本文，没有更改 Dockerfile、Compose、环境文件或业务代码，没有构建镜像、启停服务、执行数据库写入或提交推送 Git。
 
 参考：[Docker HEALTHCHECK](https://docs.docker.com/reference/dockerfile/#healthcheck)、[Compose healthcheck](https://docs.docker.com/reference/compose-file/services/#healthcheck)、[Compose 启动依赖](https://docs.docker.com/compose/how-tos/startup-order/)、[pg_isready](https://www.postgresql.org/docs/17/app-pg-isready.html)、[构建与容器代理](https://docs.docker.com/engine/cli/proxy/)。
+
+## 48. API 容器安全配置（2026-11-17）
+
+本次在 `day9/docker-compose.yml` 的 `api` 服务下增加安全设置，保留原有 `env_file`、本机端口映射与数据库健康依赖。当前相关配置如下：
+
+```yaml
+  api:
+    image: cloudtask-api:2.3.3-health
+    build:
+      context: ..
+      dockerfile: day9/Dockerfile
+    env_file:
+      - .env.docker
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    stop_grace_period: 20s
+```
+
+| 配置 | 作用 | 与本项目的关系 |
+| --- | --- | --- |
+| `read_only: true` | 将容器根文件系统设为只读 | API 日志写到标准输出，业务数据写入 PostgreSQL、Redis；当前未发现运行代码需要写本地文件 |
+| `cap_drop: [ALL]` | 移除容器全部 Linux Capabilities | API 监听 8080、访问数据库和缓存不需要额外能力 |
+| `security_opt` 中的 `no-new-privileges:true` | 阻止进程及其子进程通过执行程序获得新的权限 | 与 Dockerfile 的 `USER 10001:10001` 配合使用 |
+| `stop_grace_period: 20s` | 停止时先发送终止信号，最多等待 20 秒后再强制结束 | 程序处理 SIGTERM，HTTP Shutdown 的超时为 10 秒，额外留出清理时间 |
+
+只读根文件系统不等于数据库只读，也不会自动把额外挂载的卷设为只读。如果以后增加上传、落盘日志或临时文件功能，需要明确提供可写卷或 tmpfs；当前无需预先增加。
+
+这次不引入自定义 seccomp、AppArmor 策略或额外容器安全工具。
+
+### 为什么移除 Capabilities 有用
+
+Linux Capabilities 将部分系统特权拆成独立能力，例如修改网络配置、挂载文件系统、改变文件属主等。普通 API 通常不需要这些能力，移除后可以减少程序误操作，以及被入侵后可利用的系统权限。
+
+非 root 用户和移除能力分别约束不同的权限来源，可以同时使用。但这些配置不会阻止攻击者读取应用本来就能读取的环境变量，也不会阻止其使用应用已有的数据库凭据访问数据。
+
+## 49. YAML 列表形式与本次格式错误
+
+列表表示一个配置项下面有多个元素，即使只有一个元素，也仍然是列表。YAML 多行列表用短横线加空格表示元素：
+
+```yaml
+cap_drop:
+  - ALL
+
+security_opt:
+  - "no-new-privileges:true"
+```
+
+下面的单行写法与上面等价：
+
+```yaml
+cap_drop: [ALL]
+security_opt: ["no-new-privileges:true"]
+```
+
+原先曾写成：
+
+```yaml
+cap_drop: ALL
+security_opt: no-new-privileges:true
+```
+
+这两个值都是字符串，而 Compose 要求这两个字段使用列表。当时实际校验报错：
+
+```text
+services.api.security_opt must be a array
+```
+
+`env_file`、`ports` 也是项目中已有的列表例子。列表内同级的短横线需要对齐，缩进使用空格，不使用 Tab。列表要求是字段的数据类型要求，不取决于目前填写了几个值。
+
+## 50. 让 Compose 构建 API 镜像
+
+只配置 `image` 时，Compose 知道使用哪个镜像，但不知道如何从本地源码构建。增加 `build` 后，将构建上下文与 Dockerfile 位置一并交给 Compose：
+
+```yaml
+build:
+  context: ..
+  dockerfile: day9/Dockerfile
+```
+
+路径分两步理解：
+
+1. `context: ..` 相对于 Compose 文件所在的 `day9` 目录，指向模块根目录 `cloudtask-go`。
+2. `dockerfile: day9/Dockerfile` 相对于构建上下文，指向已有 Dockerfile。
+
+这样 Dockerfile 才能访问根目录的 `go.mod`、`go.sum` 和 `day9` 源码。根目录的 `.dockerignore` 会排除本地环境文件等不应进入构建上下文的内容。
+
+统一在 `cloudtask-go` 目录运行：
+
+```powershell
+# 校验格式；无输出且退出码为 0 表示通过
+docker compose -f day9/docker-compose.yml config --quiet
+
+# 启动前构建，再应用服务配置
+docker compose -f day9/docker-compose.yml up -d --build
+
+# 查看容器状态及 API 日志
+docker compose -f day9/docker-compose.yml ps
+docker compose -f day9/docker-compose.yml logs --tail 100 api
+```
+
+`build` 是构建规则，`--build` 明确要求启动前执行构建。普通 `up -d` 不会自动监测源码变化；以后修改 Go 代码后，使用带 `--build` 的命令。构建会复用可用缓存，不等于每次从头下载、编译全部内容。
+
+这仍是本地构建流程，不代表已经接入 CI/CD。以后可以由 CI 构建、测试并推送带版本或提交标识的镜像，部署环境再拉取运行。
+
+## 51. 重新构建后，镜像、tag 与容器如何变化
+
+`image: cloudtask-api:2.3.3-health` 同时指定本地构建产物的名称与标签。tag 是可移动的名字，并不是镜像内容永久不变的保证。
+
+```text
+构建前：cloudtask-api:2.3.3-health → 镜像 A
+修改源码并重新构建后：cloudtask-api:2.3.3-health → 镜像 B
+```
+
+如果构建产生了不同的镜像，标签会指向新镜像。旧镜像不会立即自动删除；没有其他标签指向它时，可能显示为 `<none>`。若构建结果没有变化，也可能继续得到相同的镜像 ID，不能认为每次 `--build` 都一定产生不同镜像。
+
+镜像标签更新不意味着已有容器立刻换用新镜像。`docker compose up -d --build` 包含后续应用步骤，检测到服务镜像变化后会重建对应容器。单独 `docker compose build api` 只构建镜像；`docker restart` 只重启原容器，都不能代替更新容器。
+
+本地学习阶段可以复用同一个 tag；正式发布更适合使用独立版本号或提交标识，并约定不覆盖，以便追踪和回滚。
+
+## 52. 多次构建会不会撑爆内存；如何管理空间
+
+主要需要关注的是磁盘占用：镜像层和构建缓存保存在 Docker 的存储中。运行中的容器消耗内存，构建过程也会临时消耗内存，但旧镜像不会因为保存在磁盘上就一直占据同等大小的运行内存。
+
+新旧镜像共享未变化的层，并非每次完整复制全部基础镜像。当前多阶段 Dockerfile 中，Go 编译器所在的构建阶段不会进入最终运行镜像，但其构建缓存仍可能占用磁盘。Compose 更新 API 时通常替换旧容器，不会每次构建就额外运行一个 API。
+
+统一在 `cloudtask-go` 目录执行以下查看命令；清理操作按需手动执行：
+
+```powershell
+# 查看镜像、容器、卷和构建缓存的空间占用
+docker system df
+
+# 清理没有标签、且没有被容器引用的悬空镜像
+docker image prune
+
+# 清理未使用的构建缓存，之后首次重新构建可能变慢
+docker builder prune
+```
+
+两条 prune 命令默认提示确认，不删除 PostgreSQL 命名数据卷；清理范围属于当前 Docker 引擎，可能涉及其他项目的未使用镜像或缓存，并非只针对本项目。日常不需要每次构建后都清理，空间不足时先查看占用再决定。不要把 `docker compose down -v` 当作镜像清理命令，它会删除项目命名数据卷。
+
+## 53. 本轮核对结果与验收边界
+
+2026-11-17 整理时，当前 Compose 已包含 API 的四项安全配置与 `build`，`cap_drop`、`security_opt` 均已改为列表，原有环境文件、端口映射和数据库健康依赖仍保留。
+
+本轮实际执行 `docker compose -f day9/docker-compose.yml config --quiet`，无输出、退出码为 0，确认当前配置通过 Compose 校验。结合现有 Dockerfile 的非 root 用户、标准输出日志和 main.go 中的 SIGTERM/10 秒 Shutdown 逻辑，这些配置与当前设计相符。
+
+配置校验不代表新配置已应用到运行中的容器。本轮仅整理本文并校验配置，没有执行镜像构建、容器重建、停机测试或清理操作；尚未验证只读根文件系统下的完整业务运行、安全选项的运行时生效情况，以及新构建镜像的健康状态。第 47 节中的容器状态属于之前的检查快照，不作为本轮运行结果。
+
+后续应用时运行第 50 节的 `up -d --build`，再检查容器状态、日志和 `/readyz`，并验证核心业务。只修改 Compose 运行时安全配置时无需重建镜像，但需要重新创建 API 容器才能应用。
+
+参考：[Compose 服务配置](https://docs.docker.com/reference/compose-file/services/)、[Compose 构建规则](https://docs.docker.com/reference/compose-file/build/)、[docker compose up](https://docs.docker.com/reference/cli/docker/compose/up/)、[Docker 磁盘占用](https://docs.docker.com/reference/cli/docker/system/df/)、[镜像清理](https://docs.docker.com/reference/cli/docker/image/prune/)、[构建缓存清理](https://docs.docker.com/reference/cli/docker/builder/prune/)。

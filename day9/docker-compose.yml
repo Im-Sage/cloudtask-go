@@ -48,6 +48,10 @@ services:
 
   api:
     image: cloudtask-api:2.3.3-health
+    # 自动构建镜像
+    build: 
+      context: ..
+      dockerfile: day9/Dockerfile
     env_file:
       - .env.docker
     ports:
@@ -55,7 +59,15 @@ services:
     depends_on:
       db:
         condition: service_healthy
-
+    read_only: true
+    # 当前 API 监听 8080、访问数据库和缓存，不需要额外能力；
+    # 也能配合 Dockerfile 中的非 root 用户使用
+    cap_drop: 
+      - ALL
+    # 用于阻止进程通过执行程序获得新的权限，设置合适。
+    security_opt: 
+      - "no-new-privileges:true"
+    stop_grace_period: 20s
 
 volumes:
       postgres_data:
