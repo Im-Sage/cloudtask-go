@@ -13,20 +13,20 @@ func TestTokenBu(t *testing.T) {
 	limiter := rate.NewLimiter(rate.Limit(10), 3)  // 每100ms补充一个令牌
 
 	passed := limiter.Allow()
-	fmt.Println("passed为%w", passed)
+	fmt.Println("passed为%v", passed)
 
 	passed = limiter.Allow()
-	fmt.Println("passed为%w", passed)
+	fmt.Println("passed为%v", passed)
 
 	passed = limiter.Allow()
-	fmt.Println("passed为%w", passed)
+	fmt.Println("passed为%v", passed)
 
 	passed = limiter.Allow()
-	fmt.Println("passed为%w", passed)
+	fmt.Println("passed为%v", passed)
 
 	time.Sleep(150 * time.Millisecond)
 
 	passed = limiter.Allow()
-	fmt.Println("passed为%w", passed)
+	fmt.Println("passed为%v", passed)
 
 }

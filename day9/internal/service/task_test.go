@@ -31,7 +31,6 @@ func TestConcurrentCacheMiss(t *testing.T) {
 	pool, err := database.NewDBPool(ctx, cfg.Postgres)
 	if err != nil {
 		log.Printf("数据库初始化失败：%v", err)
-		return
 	}
 	defer pool.Close()
 	taskRepository := repository.NewTaskRepository(pool)
