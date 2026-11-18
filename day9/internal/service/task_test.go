@@ -18,7 +18,7 @@ import (
 
 func TestConcurrentCacheMiss(t *testing.T) {
 	cfg, err := config.Load()
-	if err != nil{
+	if err != nil {
 		log.Printf("配置文件加载失败：%v", err)
 		return
 	}
@@ -31,7 +31,6 @@ func TestConcurrentCacheMiss(t *testing.T) {
 	pool, err := database.NewDBPool(ctx, cfg.Postgres)
 	if err != nil {
 		log.Printf("数据库初始化失败：%v", err)
-		return
 	}
 	defer pool.Close()
 	taskRepository := repository.NewTaskRepository(pool)
@@ -110,7 +109,7 @@ func TestConcurrentCacheMiss(t *testing.T) {
 
 func TestRandomTTL(t *testing.T) {
 	cfg, err := config.Load()
-	if err != nil{
+	if err != nil {
 		log.Printf("配置文件加载失败：%v", err)
 		return
 	}

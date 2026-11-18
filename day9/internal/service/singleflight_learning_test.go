@@ -32,7 +32,7 @@ func TestSingleflightSameKey(t *testing.T) {
 					// 统计回调
 					count.Add(1)
 					// 模拟耗时查询，让其他请求有机会加入等待
-                    time.Sleep(100 * time.Millisecond)
+					time.Sleep(100 * time.Millisecond)
 					return "任务12的数据", nil
 				})
 			if err != nil {

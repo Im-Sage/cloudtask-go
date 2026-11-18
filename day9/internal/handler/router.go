@@ -18,7 +18,6 @@ func NewRouter(taskService *service.TaskService, pool *pgxpool.Pool) *gin.Engine
 
 	router.GET("/readyz", healthHandler.readySys)
 
-
 	router.POST("/tasks", taskHandler.CreateTask)
 
 	router.GET("/tasks/:id", taskHandler.GetTaskByID)

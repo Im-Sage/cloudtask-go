@@ -8,16 +8,16 @@ import (
 	"time"
 
 	"github.com/Im-Sage/cloudtask-go/day9/internal/cache"
+	"github.com/Im-Sage/cloudtask-go/day9/internal/config"
 	"github.com/Im-Sage/cloudtask-go/day9/internal/database"
 	"github.com/Im-Sage/cloudtask-go/day9/internal/repository"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
-	"github.com/Im-Sage/cloudtask-go/day9/internal/config"
 )
 
 func TestRedisStop(t *testing.T) {
 	cfg, err := config.Load()
-	if err != nil{
+	if err != nil {
 		log.Printf("配置文件加载失败：%v", err)
 		return
 	}

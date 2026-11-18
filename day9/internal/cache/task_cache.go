@@ -218,13 +218,13 @@ func fun1() {
 	// 从Redis中读取并反序列化为Task
 	data, err = client.Get(ctx, key).Bytes()
 	if err != nil {
-		fmt.Errorf("发生错误：%v", err)
+		log.Printf("失败:%v", err)
 	}
 
 	var task1 model.Task
 
 	if err := json.Unmarshal(data, &task1); err != nil {
-		fmt.Errorf("发生错误：%v", err)
+		log.Printf("失败:%v", err)
 	}
 	fmt.Printf("key为：%s,值为：%v", key, task1)
 
