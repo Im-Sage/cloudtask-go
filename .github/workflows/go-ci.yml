@@ -1,0 +1,61 @@
+# 工作流的名称
+name: CloudTask Go CI
+
+# 触发条件：监听main分支的push，以及目标为main的PR
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+# 权限设置
+permissions:
+  contents: read
+
+# 工作流中包含的任务
+jobs:
+  quality:  # 若不指定name则默认使用它的标识符quality
+    name: Go quality checks
+    runs-on: ubuntu-latest  # 使用GitHub托管的最新Ubuntu环境
+    timeout-minutes: 15 # 这个job最长运行时间限制为15分钟
+
+    # quality job中的所有run步骤(所有执行shell命令的步骤)设置为全部统一配置
+    defaults:
+      run:
+        shell: bash  # 强制所有脚本命令都在bash环境中执行
+        # 默认工作目录为当前仓库的根目录
+        working-directory: .
+
+    steps:
+      # 步骤1：调用官方Action 把当前仓库的代码拉取到虚拟机中
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # 步骤2：为 Runner 安装或选择指定的 Go 版本，并配置 Go 工具链。
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      # 步骤3：执行gofmt, 查看代码是否格式化, 那些未格式化的文件吗保存到unformatted变量中
+      - name: Check Go formatting
+        # 如果该变量不为空，脚本就会打印出这些文件名，并执行 exit 1。
+        run: |
+          unformatted=$(gofmt -l ./day9)
+          if [ -n "$unformatted" ]; then
+            echo "以下文件需要执行 gofmt:"
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+      
+      # 步骤4： 执行go vet 
+      - name: Run go vet
+        run: go vet ./day9/...
+
+      # 步骤5： 执行API(Go 程序)编译 指定编译输出的二进制文件路径为"$RUNNER_TEMP/cloudtask-api"
+      - name: Build 执行API
+        run: go build -o "$RUNNER_TEMP/cloudtask-api" ./day9/cmd/server
