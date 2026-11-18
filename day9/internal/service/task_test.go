@@ -18,7 +18,7 @@ import (
 
 func TestConcurrentCacheMiss(t *testing.T) {
 	cfg, err := config.Load()
-	if err != nil{
+	if err != nil {
 		log.Printf("配置文件加载失败：%v", err)
 		return
 	}
@@ -109,7 +109,7 @@ func TestConcurrentCacheMiss(t *testing.T) {
 
 func TestRandomTTL(t *testing.T) {
 	cfg, err := config.Load()
-	if err != nil{
+	if err != nil {
 		log.Printf("配置文件加载失败：%v", err)
 		return
 	}
