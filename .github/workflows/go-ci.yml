@@ -31,7 +31,7 @@ jobs:
     steps:
       # 步骤1：调用官方Action 把当前仓库的代码拉取到虚拟机中
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -59,3 +59,11 @@ jobs:
       # 步骤5： 执行API(Go 程序)编译 指定编译输出的二进制文件路径为"$RUNNER_TEMP/cloudtask-api"
       - name: Build 执行API
         run: go build -o "$RUNNER_TEMP/cloudtask-api" ./day9/cmd/server
+
+      # 步骤6： 执行Go单元测试Step
+      - name: Run Go unit tests
+        run: go test -count=1 ./day9/...
+
+      # 步骤7：检测测试执行过程中是否发生数据竞争
+      - name: Run Go tests with race detector
+        run: go test -race -count=1 ./day9/...

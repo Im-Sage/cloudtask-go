@@ -1,3 +1,5 @@
+//go:build integration
+
 package service
 
 import (
@@ -16,11 +18,11 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// TestConcurrentCacheMiss 需要可用的 PostgreSQL（包含任务 ID 12）和 Redis。
 func TestConcurrentCacheMiss(t *testing.T) {
 	cfg, err := config.Load()
 	if err != nil {
-		log.Printf("配置文件加载失败：%v", err)
-		return
+		t.Fatalf("配置加载失败：%v", err)
 	}
 	// 准备测试Service
 	ctx, cancel := context.WithTimeout(
@@ -30,7 +32,7 @@ func TestConcurrentCacheMiss(t *testing.T) {
 	defer cancel()
 	pool, err := database.NewDBPool(ctx, cfg.Postgres)
 	if err != nil {
-		log.Printf("数据库初始化失败：%v", err)
+		t.Fatalf("初始化数据库失败：%v", err)
 	}
 	defer pool.Close()
 	taskRepository := repository.NewTaskRepository(pool)
@@ -51,7 +53,7 @@ func TestConcurrentCacheMiss(t *testing.T) {
 
 	err = rdb.Ping(redisCtx).Err()
 	if err != nil {
-		t.Fatalf("Redis 暂不可用，继续启动服务：%v", err)
+		t.Fatalf("连接 Redis 失败：%v", err)
 	}
 
 	bloomKey := "cloudtask:task:bloom:build:" + uuid.NewString()
@@ -107,11 +109,11 @@ func TestConcurrentCacheMiss(t *testing.T) {
 	// TODO 7: 等待全部请求结束并检查结果
 }
 
+// TestRandomTTL 需要可用的 PostgreSQL（包含任务 ID 11–61）和本机 Redis（127.0.0.1:6379）。
 func TestRandomTTL(t *testing.T) {
 	cfg, err := config.Load()
 	if err != nil {
-		log.Printf("配置文件加载失败：%v", err)
-		return
+		t.Fatalf("配置加载失败：%v", err)
 	}
 	// 准备测试Service
 	ctx, cancel := context.WithTimeout(
@@ -121,8 +123,7 @@ func TestRandomTTL(t *testing.T) {
 	defer cancel()
 	pool, err := database.NewDBPool(ctx, cfg.Postgres)
 	if err != nil {
-		log.Printf("数据库初始化失败：%v", err)
-		return
+		t.Fatalf("初始化数据库失败：%v", err)
 	}
 	defer pool.Close()
 	taskRepository := repository.NewTaskRepository(pool)
@@ -143,7 +144,7 @@ func TestRandomTTL(t *testing.T) {
 
 	err = rdb.Ping(redisCtx).Err()
 	if err != nil {
-		t.Fatalf("Redis 暂不可用，继续启动服务：%v", err)
+		t.Fatalf("连接 Redis 失败：%v", err)
 	}
 
 	bloomKey := "cloudtask:task:bloom:build:" + uuid.NewString()

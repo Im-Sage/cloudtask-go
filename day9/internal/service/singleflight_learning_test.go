@@ -25,7 +25,7 @@ func TestSingleflightSameKey(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			<-startChannel
+			<-startChannel // 管道中无数据且未关闭时阻塞在这
 			value, err, shared := group.Do(
 				"task:12",
 				func() (any, error) {
@@ -47,6 +47,8 @@ func TestSingleflightSameKey(t *testing.T) {
 			t.Logf("value=%v, shared=%v", value, shared)
 		}()
 	}
+	// 本次循环并没有向管道中存放数据，此时20个Goroutine都被阻塞在<-startChannel
+	// 一旦关闭管道，20个Goroutine同时被释放，模拟的很精妙 // 集中放行
 	close(startChannel)
 	wg.Wait()
 
@@ -56,12 +58,64 @@ func TestSingleflightSameKey(t *testing.T) {
 	if actual != 1 {
 		t.Errorf("期望回调执行 1 次，实际执行 %d 次", actual)
 	}
+}
 
-	// TODO 3: 每个 Goroutine 调用 group.Do()
+func TestSingleflightSameKeyDoChan(t *testing.T) {
+	var group singleflight.Group
+	var count atomic.Int32
 
-	// TODO 4: fn 内增加 count，并模拟耗时操作
+	// 不关闭release，回调就不能结束
+	release := make(chan struct{})
 
-	// TODO 5: 等待全部 Goroutine 返回
+	work := func() (any, error) {
+		count.Add(1) // 回调次数+1
+		<-release
+		return "任务12的数据", nil
+	}
 
-	// TODO 6: 检查 count 和各个请求的返回结果
+	const callers = 20
+	// 创建一个长度为callers的切片，每一个元素用来保存一个只接收的结果Channel
+	// singleflight.Result 管道传递的数据类型
+	/**
+		type Result struct {
+		Val    interface{} // 返回的数据
+		Err    error
+		Shared bool
+	}
+	*/
+	results := make([]<-chan singleflight.Result, callers)
+
+	// DoChan注册调用后立即返回接受结果Channel，不必须等待工作完成。 Do返回 Result类型，等待任务完成
+	// 此时回调被release阻塞，不会提前结束  -- 重点
+	// 开始注册
+	for i := range results {
+		results[i] = group.DoChan("task:12", work)
+		// 所有调用都注册完成，才允许回调返回
+	}
+	close(release)
+	// --以上属于注册阶段
+	// 给整个结果收集过程设置超时，避免无限等待
+	timer := time.NewTimer(3 * time.Second)
+	defer timer.Stop()
+
+	for i, ch := range results {
+		select {
+		case result := <-ch:
+			if result.Err != nil {
+				t.Errorf("调用 %d：预期无错误，实际为 %v", i, result.Err)
+			}
+			if result.Val != "任务12的数据" {
+				t.Errorf("调用 %d：预期得到任务12的数据，实际为 %v",
+					i, result.Val)
+			}
+			if !result.Shared {
+				t.Errorf("调用 %d：预期结果被共享", i)
+			}
+		case <-timer.C:
+			t.Fatalf("等待调用 %d 的结果超时", i)
+		}
+	}
+	if got := count.Load(); got != 1 {
+		t.Fatalf("预期回调执行 1 次，实际执行 %d 次", got)
+	}
 }
