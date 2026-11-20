@@ -2,9 +2,11 @@
 
 记录日期：2026-11-12。
 
+最新补充：2026-11-18，第 54～65 节记录 GitHub Actions 基础 CI、分支与 PR、质量检查、运行排错和概念问答。此前章节保留历史状态；当前 CI 进展与验证边界见第 65 节。
+
 后续补充：2026-11-13，第 14～23 节记录迁移管理、备份恢复、日志、健康检查和优雅退出。2026-11-16，第 24～34 节补充项目工程规范、Docker 多阶段构建、Compose 运行、交付及 Git 管理；第 35～41 节补充镜像瘦身、非 root 运行、Linux 权限及 docker run 环境变量引号问题。2026-11-17，第 42～47 节补充健康检查，第 48～53 节补充 API 容器安全配置、YAML 列表、Compose 构建、镜像标签与空间管理。前文保留当时的排查过程；最新配置核对结果与验收边界以第 53 节为准。
 
-最初主要完成 CI/CD 前的配置管理准备：将连接地址、连接池参数、超时等从启动代码中提取，通过环境变量加载到 Config，再传给各组件。近期已进一步完成 Docker 镜像构建与本机 Compose 运行；用户已反馈构建及 API 访问成功。这仍不代表 CI 流水线、镜像自动发布或远程自动部署已经完成。
+最初主要完成 CI/CD 前的配置管理准备：将连接地址、连接池参数、超时等从启动代码中提取，通过环境变量加载到 Config，再传给各组件。随后完成 Docker 镜像构建与本机 Compose 运行；截至 2026-11-18，已根据 GitHub 运行截图确认基础 CI Job 成功，尚不代表镜像自动发布或远程自动部署已经完成。
 
 ## 1. Config 结构与职责
 
@@ -1911,3 +1913,291 @@ docker builder prune
 后续应用时运行第 50 节的 `up -d --build`，再检查容器状态、日志和 `/readyz`，并验证核心业务。只修改 Compose 运行时安全配置时无需重建镜像，但需要重新创建 API 容器才能应用。
 
 参考：[Compose 服务配置](https://docs.docker.com/reference/compose-file/services/)、[Compose 构建规则](https://docs.docker.com/reference/compose-file/build/)、[docker compose up](https://docs.docker.com/reference/cli/docker/compose/up/)、[Docker 磁盘占用](https://docs.docker.com/reference/cli/docker/system/df/)、[镜像清理](https://docs.docker.com/reference/cli/docker/image/prune/)、[构建缓存清理](https://docs.docker.com/reference/cli/docker/builder/prune/)。
+
+## 54. 本阶段目标：为 CloudTask 引入基础 CI
+
+本阶段在 `ci/github-actions` 分支上，为目标为 `main` 的 PR 和 `main` 上的 push 增加自动质量检查。现有分支已能承载这项工作，无需另建 `ci/actions-quality`。
+
+本次范围：
+
+- Workflow 名称为 `CloudTask Go CI`，Job 名称为 `Go quality checks`。
+- 使用标准 GitHub 托管的 `ubuntu-latest` Runner。
+- 先 checkout，再 setup-go；命令从包含 `go.mod` 的仓库根目录运行。
+- 检查 `day9` 的格式、运行 `go vet`，编译 API 入口。
+- 检查失败时让 Job 失败；只授予 `contents: read`，不配置真实数据库密码。
+
+当前没有在工作流中执行完整测试、启动 API、构建或推送 Docker 镜像，也没有自动部署。
+
+## 55. CI 与 CD：纠正“CI 不真正运行程序”的理解
+
+CI（Continuous Integration，持续集成）围绕频繁提交和集成，通过自动构建、检查和测试尽早发现问题。它不限定必须在云端，也不限于部署前执行。
+
+CI 可以实际运行程序：例如运行单元测试、启动 API、连接临时数据库并执行集成测试。本项目当前只配置静态检查和编译，是当前工作流的范围，不是 CI 本身的限制。
+
+CD 常见的两种含义：
+
+| 名称 | 含义 |
+| --- | --- |
+| Continuous Delivery：持续交付 | 自动完成验证和发布准备，正式部署可以保留人工批准 |
+| Continuous Deployment：持续部署 | 改动通过验证后自动部署到生产环境 |
+
+CloudTask 需要 CI，让每次 PR 接受同一套检查，减少遗漏格式问题、可疑代码和编译错误。CI 通过只代表已配置的检查通过，不保证全部业务正确，也不会自动禁止合并失败的 PR；强制检查通过后才能合并，需要额外设置分支规则。
+
+## 56. Workflow、Job、Step、Runner 与 Action
+
+| 概念 | 含义 | 本项目示例 |
+| --- | --- | --- |
+| Workflow | 由 YAML 定义的自动化流程，包含触发条件、权限及 Job | `CloudTask Go CI` |
+| Job | 在 Runner 上执行的一组步骤 | `quality`，显示名为 `Go quality checks` |
+| Step | Job 内的一个执行单元，可运行脚本或调用 Action | 格式检查、`go vet`、编译 |
+| Runner | 接收并执行 Job 的运行机器及其代理程序 | `ubuntu-latest` |
+| Action | 可以在步骤中调用的可复用工具 | `actions/checkout`、`actions/setup-go` |
+
+同一 Job 内的步骤通常顺序执行。不同 Job 默认可以并行，通过 `needs` 建立依赖；Runner 执行的是 Job，不应把它理解成整个 Workflow 共用的唯一机器。GitHub 托管的普通 Job 通常各自使用新的环境。
+
+```yaml
+# 调用 Action，不是一条 Linux 命令
+uses: actions/setup-go@v7
+
+# 在当前 Runner 的 Shell 中执行命令
+run: go vet ./day9/...
+```
+
+`actions/setup-go@v7` 表示引用 GitHub 上 `actions` 组织的 `setup-go` 仓库，使用 `v7` 版本标签。Action 也可以用提交 SHA 固定版本。
+
+checkout 和 setup-go 是通过 Node.js 执行的 JavaScript Action，不局限于 Linux。自定义 Action 常见形式有 Composite、JavaScript、Docker；入口通常为 `action.yml` 或 `action.yaml`。公开仓库中的 Action 可以直接通过 `用户名/仓库名@版本` 引用，不必先上架 Marketplace。Workflow 是编排流程，Action 是流程中可复用的工具。
+
+## 57. 开发分支、提交、推送和 PR 的完整关系
+
+`ci/github-actions` 是一个完整分支名。`/` 是命名习惯，不代表 Git 中存在 `ci` 与 `github-actions` 两级父子分支，也不是必须使用的字符。
+
+当前工作未完成时继续使用本分支；合并后有新的独立需求，再从更新后的 `main` 建分支，例如 `ci/add-integration-tests`，无需用 `github-actions2` 编号。
+
+| 操作 | 作用 |
+| --- | --- |
+| `git add <路径>` | 将选定改动加入暂存区 |
+| `git commit` | 将暂存内容保存到当前本地分支历史 |
+| `git push` | 向远程上传已有提交，不自动上传未提交的文件 |
+| 创建 PR | 请求将来源分支的改动合入目标分支，不会立即合并 |
+| 合并 PR | 将改动正式合入目标分支 |
+
+命令均从 `cloudtask-go` 运行，按实际改动选择文件，避免误提交压缩包和二进制产物：
+
+```powershell
+git branch --show-current
+git status
+git diff
+git add .github/workflows/go-ci.yml
+# 如有必要修正，再按路径添加相应 Go 文件和 .gitignore
+git diff --cached
+git commit -m "ci: add GitHub Actions workflow"
+git push -u origin ci/github-actions
+```
+
+`origin` 是远程仓库别名；`-u` 为本地和远程分支建立上游跟踪关系，后续在该分支上通常直接 `git push`。分支名必须准确，`ci/github-action` 与 `ci/github-actions` 不同。
+
+GitHub 创建 PR 时选择 base 为 `main`，compare/head 为 `ci/github-actions`。后续继续向这个开发分支 push，会更新同一个尚未合并的 PR，不需要重复创建。
+
+补充 Git 命令理解：
+
+- `git fetch origin`：获取远程提交并更新远程跟踪引用，不修改当前工作区或自动合并。
+- `git switch main`：切换到本地 `main`；会按目标分支更新文件，遇到会覆盖的未提交改动通常拒绝切换。不要随意使用强制丢弃选项。
+- `git pull --ff-only origin main`：可以更新本地分支和工作区；“只允许快进”不代表“不修改文件”。
+- `git log -3 --oneline`：查看当前分支可追溯的最近 3 条提交，每条用短哈希和提交说明显示。
+- 新建分支保留当前提交及工作区状态，但不等于备份未提交改动。
+
+本次曾在 `main` 上提交测试调整。若类似情况再次出现，只有确认需要移动的是最新这一条、尚未推送到远程 main，并且新分支成功创建后，才可以在新分支上用 `git branch -f main HEAD~1` 回移本地 main 指针。这是特定条件下的处理方法，不是日常 CI 操作；已推送的 main 不应照搬回退。
+
+## 58. push 与 pull_request 的触发条件
+
+```yaml
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+```
+
+- `push`：远程分支或标签被推送更新；本配置只选择 `main` 分支更新，PR 合并到 main 通常也会触发。
+- `pull_request`：PR 创建、重新打开或来源分支新增提交等活动；这里筛选的是目标分支为 `main` 的 PR，并非要求来源分支叫 main。
+- `pull_request` 不是 `git pull`。clone、fetch、pull 不会因此触发该 PR 事件。
+
+按当前配置，只 push 开发分支但未创建 PR 时不会触发。创建目标为 main 的 PR 后运行检查，后续 push 更新该 PR 会再次检查。
+
+## 59. 本轮工作流配置与关键参数
+
+2026-11-18 本地文件核对版本如下，省略解释性注释。此版本已将 checkout 更新为 v7；不将此前截图中的成功运行视为这个更新版本的验证结果。
+
+```yaml
+name: CloudTask Go CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Go quality checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+        working-directory: .
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Check Go formatting
+        run: |
+          unformatted=$(gofmt -l ./day9)
+          if [ -n "$unformatted" ]; then
+            echo "以下文件需要执行 gofmt:"
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+      - name: Run go vet
+        run: go vet ./day9/...
+      - name: Build 执行API
+        run: go build -o "$RUNNER_TEMP/cloudtask-api" ./day9/cmd/server
+```
+
+文件位置必须是 `cloudtask-go/.github/workflows/go-ci.yml`，不能放在仓库父目录的 `.github` 下。工作目录 `.` 是 checkout 后包含 `go.mod` 的仓库根目录，不是 day9，也不是本机绝对路径。
+
+checkout 准备源代码，setup-go 准备工具链。`go-version-file: go.mod` 让 CI 跟随项目声明，避免在 YAML 中另外随意维护版本；它不自动保证本地与 CI 的全部环境一致。本轮模块声明为 Go 1.26.0，早期 README 的 1.25.7 属于待统一说明。
+
+`contents: read` 是 GITHUB_TOKEN 对 GitHub 资源的权限，不限制 Runner 本地文件写入；编译、缓存和下载依赖仍可进行。`persist-credentials: false` 避免为后续 Git 操作保留 checkout 认证凭据。当前检查不启动数据库或服务，因此无需真实数据库密码。
+
+## 60. gofmt、go vet、go build 与失败传播
+
+| 检查 | 能发现的问题 | 验证边界 |
+| --- | --- | --- |
+| `gofmt -l ./day9` | 文件格式与 Go 标准格式有差异 | 只列文件名，不验证业务逻辑 |
+| `go vet ./day9/...` | 静态分析发现可疑用法 | 不证明全部运行路径正确 |
+| `go build ... ./day9/cmd/server` | API 及其依赖的编译问题 | 不启动 API，不验证数据库或业务 |
+
+`gofmt -l` 单纯发现格式差异时通常返回 0，因此仅执行命令可能出现“有输出但 CI 通过”。读取文件失败或语法错误则可能返回非零。
+
+工作流中的 `$(...)` 捕获文件名，`[ -n "$unformatted" ]` 检查字符串非空，`exit 1` 让格式门禁失败。本地修复使用 `gofmt -w ./day9`，执行后检查差异再提交。曾误写为 `if [ -n "$unformatted"]; then`，右方括号前缺空格；该错误处于 if 条件中，不能假定 Shell 会自动让整个步骤失败，可能导致门禁失效。
+
+本轮 go vet 曾报告两类问题：
+
+1. 两个 task_cache.go 中共 4 处 `fmt.Errorf` 的返回值未使用。该函数创建 error，不自动打印；需要按调用约定 return、赋值或明确记录日志，不能机械改成统一处理方式。
+2. TokenBucket_test.go 中共 5 处 `fmt.Println` 带 `%v`。Println 不解析占位符；可改用 `fmt.Printf("...%v\n", value)`、`fmt.Println("...", value)` 或测试中的 `t.Logf`。
+
+当前 Bash 设置下，未被处理的命令失败通常使 Step 失败，后续普通 Step 跳过，Job 失败；但不等于整个 Workflow 立即终止：独立 Job 可继续，`if: always()` 步骤和相应 Post 收尾仍可能执行。`continue-on-error`、条件表达式等也会影响结果。质量门禁不应使用 `|| true` 隐藏失败。
+
+本地编译示例：
+
+```powershell
+go vet ./day9/...
+go build -o .\day9\cloudtask-ci.exe ./day9/cmd/server
+Get-Item .\day9\cloudtask-ci.exe
+```
+
+go build 成功时通常没有输出。`-o` 指定的是输出文件，文件位于 day9，不是入口包目录；本次曾确认该 exe 已生成。Git 忽略规则可加入 `/day9/cloudtask-ci.exe`，保留本地文件但不提交。已暂存但尚未提交时，可用 `git restore --staged -- day9/cloudtask-ci.exe` 取消暂存；已被 Git 跟踪的文件不会仅靠 .gitignore 自动停止跟踪。
+
+CI 中 `$RUNNER_TEMP/cloudtask-api` 是 Ubuntu Runner 的临时产物，不是 Windows exe，也没有自动上传成 Artifact。
+
+## 61. 为什么暂不直接加入 go test ./...
+
+原因不只是“测试没有全部写完”，而是部分测试还不能在干净环境中可靠、重复地运行：
+
+- 部分测试连接真实 PostgreSQL、Redis，依赖本机配置。
+- 查询固定任务 ID，临时空数据库未必有这些记录。
+- 之前发现 TestRedisStop 在配置或数据库初始化失败时仅打印日志后 return，可能出现实际没验证却通过。
+- 模块级 `./...` 会覆盖早期 dayN 练习，超出本阶段 day9 的检查范围。
+
+后续先接入不依赖外部服务的单元测试，再分离集成测试，为它们创建临时服务、初始化结构、准备数据和清理资源。集成测试启用后，必要依赖初始化失败应明确使测试失败；若需要验证布隆过滤器，Redis 环境还应具备相应模块。
+
+不需要等所有测试完善后才使用 CI，但不能把未经准备的测试全量运行或编译成功当作业务验证完成。
+
+## 62. Checks 为 0 的排查与处理
+
+PR 最初显示 `Checks 0`，没有任何运行记录。本地排查发现：
+
+```text
+?? .github/
+```
+
+这表示工作流目录未跟踪。尽管已有提交说明写着添加 CI，提交树中实际没有该文件，GitHub 无法运行本地未提交的工作流。
+
+处理顺序：确认位于仓库内 `.github/workflows/` → 修复 Bash 空格问题 → git add → 核对 `git diff --cached` → commit → push。文件提交到现有 PR 的来源分支后，无需新建 PR，更新会触发检查。
+
+排查时先区分“没有运行记录”和“已经运行但失败”。前者先看路径、是否进入提交、是否 push、触发条件；后者进入具体 Step 日志查看命令与错误。
+
+## 63. 成功运行、Annotations 和两个 Post 步骤
+
+用户提供的 GitHub 截图显示 `Go quality checks` 成功，耗时 49 秒，各步骤均显示成功状态：
+
+| Step | 含义 |
+| --- | --- |
+| Set up job | 准备 Runner 环境和 Action |
+| Checkout Code | 检出本次检查对应的代码 |
+| Set up Go | 配置 Go 工具链和缓存恢复等 |
+| Check Go formatting | 执行自定义格式检查脚本 |
+| Run go vet | 执行静态分析 |
+| Build 执行API | 编译 API，不启动 API |
+| Post Set up Go | 条件满足时处理或保存 Go 缓存等收尾 |
+| Post Checkout Code | 按配置清理 Git 认证或临时配置等 |
+| Complete job | 完成 Job 收尾 |
+
+Post 是 Action 注册的执行后收尾逻辑，不是 HTTP POST，也不是重复 checkout 或重新运行检查。通常逆序收尾：先 Checkout，再 Set up Go，最后 Post Set up Go、Post Checkout。具体缓存命中或保存情况需要展开日志，不能仅凭步骤名确定。
+
+截图还有 1 warning 和 1 notice：
+
+- Warning：checkout@v4 原本使用 Node.js 20，平台提示该运行时弃用并强制使用 Node.js 24。这是执行 Action 的运行时，与 Go API 的依赖无关，无需给 Go 项目安装 Node.js。本地工作流后来已改为 checkout@v7；该改动是否消除警告需要新一轮运行确认。
+- Notice：ubuntu-latest 将迁移到 Ubuntu 26。latest 是随平台变化的标签，不是固定系统版本；本次提示没有使 Job 失败。
+
+这次成功记录证明配置中的步骤报告成功，不证明 API 已实际运行、Docker 镜像已构建或所有测试通过。还应有意引入格式或编译错误，再修复并观察 CI 由失败恢复成功，验证门禁确实有效；本轮未确认已完成这个演练。
+
+## 64. API 镜像与 Actions 费用问答
+
+### 64.1 API 镜像与 Go 程序的关系
+
+API 镜像将构建时的 Go API 二进制、Alpine 基础文件系统、证书和 curl，以及启动用户、健康检查和命令等配置打包。多阶段构建先用 Go 工具链编译，再把产物复制到运行阶段，最终运行镜像不包含完整 Go 编译工具链。
+
+PostgreSQL、Redis 是 Compose 中另外的容器，不在 API 镜像里。修改本地源码不会更新已有镜像或容器，需要重新构建并更新容器。当前 CI 直接编译 API，不等于重新构建 Docker 镜像。
+
+### 64.2 当前学习配置的费用边界
+
+按 2026-11-18 会话查阅的 GitHub 官方计费说明：公开仓库使用标准 GitHub 托管 Runner 的计算时间免费；私有仓库先使用套餐包含的计算额度，超出后按费率计费。大型 Runner 是公开仓库免费规则的例外；自托管 Runner 的机器成本自行承担。
+
+费用区分计算与存储：计算累计各 Job 的实际使用，失败和重跑也消耗资源；工件和缓存有不同额度及保留时间规则。当前没有上传 Artifact，临时编译文件不等于长期工件；setup-go 默认启用缓存。
+
+具体套餐额度、费率及预算规则会变化，使用时查看官方说明和账户账单。上次会话中的价格示例不是固定长期承诺，也未核对账户实际账单或仓库可见性。
+
+## 65. 本轮整理结果、待验证事项与参考
+
+截至 2026-11-18：
+
+- 已使用 `ci/github-actions` 分支提交改动，用户已创建目标为 main 的 PR。
+- 已定位并处理“工作流未进入提交导致 Checks 0”的问题，后续用户截图显示基础 CI Job 成功。
+- 本次整理时，本地工作流包含修正后的 Bash 条件和 checkout@v7、setup-go@v7；git status 显示工作流仍有未提交修改，不能视为该版本已经 push 或在 GitHub 验证通过。
+- 本轮仅整理笔记、读取配置和核对 Git 差异，没有替用户提交、push、合并 PR，也没有运行新的 CI、测试或部署。
+
+后续应核对差异并提交需要的 Action 升级，push 后观察最新提交的 Checks；展开日志确认 Go 版本、格式检查、vet、编译及警告状态。完成一次失败与修复演练后，再决定合并 PR，并继续建设可靠测试和 Docker 构建检查。
+
+参考资料：
+
+- [GitHub Actions 基本概念](https://docs.github.com/en/actions/get-started/understand-github-actions)
+- [Workflow 语法、事件筛选、权限和步骤行为](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax)
+- [Go 项目的构建和测试](https://docs.github.com/en/actions/tutorials/build-and-test-code/go)
+- [actions/checkout](https://github.com/actions/checkout)
+- [actions/setup-go](https://github.com/actions/setup-go)
+- [gofmt 文档](https://pkg.go.dev/cmd/gofmt)
+- [GitHub Actions 计费](https://docs.github.com/zh/billing/concepts/product-billing/github-actions)

@@ -137,7 +137,9 @@ func (s *TaskService) GetTaskByID(
 			// 使用信号量控制同时执行的请求数量
 			select {
 			case s.slots <- struct{}{}: // 获取名额
-				defer func() { <-s.slots }()
+				defer func() {
+					<-s.slots
+				}()
 				if err := ctx.Err(); err != nil { // 防止有空位和context超时 同时就绪的情况
 					return nil, err
 				}

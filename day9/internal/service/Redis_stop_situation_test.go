@@ -1,3 +1,5 @@
+//go:build integration
+
 package service
 
 import (
@@ -15,11 +17,12 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// TestRedisStop 需要可用的 PostgreSQL（包含任务 ID 11–61）。
+// 它使用 Redis 客户端，但允许 Redis 不可用，以观察回源行为。
 func TestRedisStop(t *testing.T) {
 	cfg, err := config.Load()
 	if err != nil {
-		log.Printf("配置文件加载失败：%v", err)
-		return
+		t.Fatalf("配置加载失败：%v", err)
 	}
 	initCtx, initCancel := context.WithTimeout(
 		context.Background(),
@@ -28,8 +31,7 @@ func TestRedisStop(t *testing.T) {
 	defer initCancel()
 	pool, err := database.NewDBPool(initCtx, cfg.Postgres)
 	if err != nil {
-		log.Printf("数据库初始化失败：%v", err)
-		return
+		t.Fatalf("初始化数据库失败：%v", err)
 	}
 	defer pool.Close()
 	taskRepository := repository.NewTaskRepository(pool)
