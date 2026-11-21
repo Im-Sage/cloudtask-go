@@ -2,7 +2,7 @@
 
 记录日期：2026-11-12。
 
-最新补充：2026-11-20，第 66～72 节记录 Go 单元测试、集成测试隔离、竞态检测、缓存验证和 PR 排错。第 54～65 节保留 2026-11-18 的基础 CI 记录。
+最新补充（2026-11-21）：第 73～80 节记录 PostgreSQL、Redis 和 Cache Aside 集成测试、本地 Docker 环境及 GitHub Actions 配置。第 66～72 节是 2026-11-20 的单元测试与 PR 排错记录，第 54～65 节是 2026-11-18 的基础 CI 记录。
 
 后续补充：2026-11-13，第 14～23 节记录迁移管理、备份恢复、日志、健康检查和优雅退出。2026-11-16，第 24～34 节补充项目工程规范、Docker 多阶段构建、Compose 运行、交付及 Git 管理；第 35～41 节补充镜像瘦身、非 root 运行、Linux 权限及 docker run 环境变量引号问题。2026-11-17，第 42～47 节补充健康检查，第 48～53 节补充 API 容器安全配置、YAML 列表、Compose 构建、镜像标签与空间管理。前文保留当时的排查过程；最新配置核对结果与验收边界以第 53 节为准。
 
@@ -2292,3 +2292,101 @@ PR #2 的第 #3 次运行因 `TokenBucket_test.go` 未格式化在 gofmt 步骤�
 - CI 分支差异还包含新增的 `leetcode/3无重复字符的最长子串.cpp`。它与上面的 Go 报错是两件事。合并前在 `Files changed` 确认是否有意一并提交；若误带，移除后再查看新的 Checks。
 
 参考：[Go 构建约束](https://pkg.go.dev/cmd/go#hdr-Build_constraints)、[Singleflight](https://pkg.go.dev/golang.org/x/sync/singleflight)、[setup-go 缓存说明](https://github.com/actions/setup-go#caching-dependency-files-and-build-outputs)、[GitHub Actions 触发事件](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request)。
+
+## 73. PostgreSQL 集成测试：验证真实 SQL 和事务
+
+测试位于 `internal/repository/task_test.go`，通过 `TEST_DATABASE_URL` 接入独立测试库。辅助函数 `newRepository(t)` 读取连接串，用 `config.PostgresConfig{...}` 构造配置，并复用 `database.NewDBPool` 创建测试自己的连接池。`Postgres` 是 `Config` 的字段名，它的类型是 `config.PostgresConfig`。连接或准备数据失败应立即用 `t.Fatalf` 结束测试。
+
+每个用例创建自己的任务，使用 PostgreSQL 返回的 ID。检查事件时，可以用 `pool.QueryRow` 按 `task_id` 和 `event_type` 直接查 `task_events`。SQL 占位符写 `$1`、`$2`，曾误写为 `&2`，编译 Go 测试时发现不了这个 SQL 错误。
+
+| 用例 | 预期行为 |
+| --- | --- |
+| `TestCreateAndGetTask` | 能按创建返回的 ID 查回任务，标题正确，初始状态为 `pending`，版本为 1 |
+| `TestChangeStatusWritesEvent` | 状态更新，版本加 1，新增一条 `status_changed` 事件 |
+| `TestChangeStatusFailRollback` | 事件写入失败，任务状态、版本、更新时间保持原样，事件数为 0 |
+| `TestChangeStatusOptimisticConflict` | 用当前版本成功更新一次，再用旧版本更新时返回 `ErrVersionConflict`，第一次结果和事件都保留 |
+
+回滚用例采用一次更新。先创建任务作为基线，再给测试库的 `task_events` 加一条仅拒绝本次任务 `status_changed` 的命名 `CHECK` 约束。用合法状态调用 `ChangeStatus`，让事务先执行任务更新，再在事件插入处失败。通过 `errors.As` 取到 `*pgconn.PgError`，核对 SQLSTATE `23514` 和约束名，随后查询数据库验证回滚。测试结束时移除约束、删除本次任务并关闭连接池。清理用独立超时 Context，且应在资源取得后尽早注册。
+
+两次更新适合乐观锁冲突用例。第一次调用的 `expectedVersion` 传任务的 `Version` 字段，第二次复用更新前的旧版本，然后用 `errors.Is` 匹配错误。结果与第一次提交后的状态比较，事件数应保持为 1。回滚用例无需先成功更新一次，否则已有事件可能让新增约束时的校验先失败。
+
+## 74. Redis 集成测试：区分 Miss、空值命中和任务命中
+
+`internal/cache/task_cache_integration_test.go` 用 `newRedis(t)` 读取 `TEST_REDIS_ADDR` 及可选的 `TEST_REDIS_USERNAME`、`TEST_REDIS_PASSWORD`。客户端创建后用 `Ping` 确认可达和认证有效，通过 `t.Cleanup` 关闭连接。
+
+| 场景 | 操作和断言 |
+| --- | --- |
+| 缓存 Miss | 先清掉测试 key，再调用 `GetResult`，断言无错误且 `Hit=false` |
+| 写入后读回 | 在测试中构造 `model.Task`，用同一个任务 ID 写入和读取，检查命中及任务字段 |
+| 空值缓存 | `SetNotFound` 后读取，断言 `Hit=true`、`Exists=false` |
+| 删除缓存 | 先写入并确认命中，调用 `DeleteTask` 后确认 Miss |
+| TTL 范围 | 调用 `SetEntry` 后用 Redis `PTTL` 读取实际剩余时间，确认大于 0 且在预期范围内 |
+
+`GetResult` 应先判断错误，再看 `Hit` 和 `Exists`。Miss 只说明缓存里没有答案。空值命中表示缓存已记录“任务不存在”。正值命中返回任务。TTL 写入配置是 `[10s, 70s)`，剩余时间在读回前会减少，测试下限要考虑这段耗时与毫秒精度。一次读回只验证 TTL 范围。共享测试 Redis 时，各用例应使用独立的 key，写入后清理。
+
+## 75. Service 集成测试：观察 Cache Aside 的实际行为
+
+`TestTaskService_CacheAside` 位于 `internal/service/task_integration_test.go`，同时依赖 PostgreSQL 和 Redis。准备阶段可通过 Repository 创建任务和清空缓存，待测的读取与更新通过 `TaskService` 完成。
+
+1. 确认初始 Miss，调用 `TaskService.GetTaskByID`，核对返回值和 Redis 回填。
+2. 只在数据库中改动测试任务的标题，保留 Redis 的原值。再次经 Service 查询，返回旧标题即可区分缓存命中和查询数据库。
+3. 调用 `TaskService.UpdateTask`，确认旧缓存消失。再次通过 Service 读取，核对新标题、状态、版本及 Redis 回填。
+
+曾在测试里直接调用 Repository 查询和更新，并用 `SetEntry` 手工写缓存。这样的做法会替 Service 完成待验证的工作。直接读 Redis 验证结果、用 SQL 构造可区分的测试数据，属于测试准备和断言。清理阶段只删除本用例创建的任务和缓存 key。
+
+## 76. 布隆过滤器与 Cache Aside 的关系
+
+启动时从 PostgreSQL 读取任务 ID，用 `BF.RESERVE` 创建过滤器，再用 `BF.MADD` 分批装入。全部成功后才标记可信。创建任务时，数据库写入成功后用 `BF.ADD` 加入新 ID。加入失败时将过滤器标为不可信，后续查询仍可走普通缓存与数据库路径。
+
+查询先看 `BF.EXISTS`。只有返回否定、无错误且过滤器可信时，Service 才直接返回 `ErrTaskNotFound`。肯定结果表示可能存在，继续检查任务详情缓存。Cache Aside 用例构造 Service 时传入 `nil`，因此“布隆过滤器不可用”是预期日志，本用例只验证缓存路径。
+
+## 77. 本地 Docker 测试环境与 Windows 端口排查
+
+在 `cloudtask-go` 根目录用 PowerShell 执行。测试程序连接宿主机的 `55432` 和 `16379`，容器内部仍使用 PostgreSQL 的 `5432` 和 Redis 的 `6379`。
+
+```powershell
+docker run --rm -d --name cloudtask-test-pg -e POSTGRES_USER=ct_test -e POSTGRES_PASSWORD=only_for_tests -e POSTGRES_DB=cloudtask_test -p 127.0.0.1:55432:5432 postgres:17
+docker run --rm -d --name cloudtask-test-redis -p 127.0.0.1:16379:6379 redis:8-alpine
+
+docker exec cloudtask-test-pg pg_isready -h 127.0.0.1 -U ct_test -d cloudtask_test
+docker exec cloudtask-test-redis redis-cli ping
+
+Get-Content -Raw ./day9/db/migrations/000001_init.up.sql |
+    docker exec -i -e PGPASSWORD=only_for_tests cloudtask-test-pg psql -h 127.0.0.1 -U ct_test -d cloudtask_test -v ON_ERROR_STOP=1
+
+$env:TEST_DATABASE_URL = 'postgres://ct_test:only_for_tests@127.0.0.1:55432/cloudtask_test?sslmode=disable'
+$env:TEST_REDIS_ADDR = '127.0.0.1:16379'
+$env:TEST_REDIS_USERNAME = ''
+$env:TEST_REDIS_PASSWORD = ''
+```
+
+确认 PostgreSQL 接受连接且 Redis 返回 `PONG` 后执行迁移。每个新建 PostgreSQL 容器执行一次迁移，并在设置环境变量的同一个 PowerShell 窗口运行测试。本地端口、用户名和密码可以与 CI 不同，各环境的变量只需对应各自的容器。
+
+曾尝试将 Redis 映射到 `56379`，Docker 创建容器后在绑定端口时失败。用 `netsh interface ipv4 show excludedportrange protocol=tcp` 确认该端口落在 Windows 保留的 `56328–56427` 范围。改用 `16379`，同时更新 `TEST_REDIS_ADDR`。测完可用 `docker stop cloudtask-test-pg cloudtask-test-redis` 停止测试服务，`--rm` 会在停止后删除容器。
+
+## 78. 测试标签与编辑器排查
+
+`//go:build integration` 放在文件顶部，并在其后留空行。`// go:build integration` 只是普通注释，拼成 `integation` 则无法匹配命令中的标签。普通 `go test` 排除集成用例，`-tags=integration` 同时纳入普通与集成用例，旧的 `integration && manual` 用例需要再开启 `manual`。
+
+VS Code 里的 Go 补全和 Ctrl+点击依赖 `gopls`。在包含 `go.mod` 的工作区打开代码，按需把 `"gopls": {"buildFlags": ["-tags=integration"]}` 加入工作区设置，再重启语言服务器。终端可用 `go test -tags=integration -run '^$' ./day9/internal/repository` 检查编译，命令不会执行测试。多行函数参数末尾缺逗号、`t.cleanup` 大小写错误等语法或类型问题也要分别处理。
+
+工作流 YAML 的补全由 GitHub Actions 扩展提供。在 `.github/workflows/go-ci.yml` 中检查右下角语言模式是否为 `GitHub Actions Workflow`，用 Ctrl+Space 在 YAML 字段位置触发建议。扩展补全工作流字段和表达式，Bash 命令由 Shell 执行。
+
+## 79. GitHub Actions 集成测试 Job
+
+`go-ci.yml` 新增与 `quality` 同级的 `integration`。它使用 `needs: quality`，格式检查、单元测试及竞态检测成功后才运行。集成 Job 自己 checkout 和 setup-go，并通过 `services` 启动带健康检查的 PostgreSQL 17 和 Redis 8。当前映射到 Runner 的 `5432`、`6379`，使用临时测试账号。
+
+- **Initialize PostgreSQL schema** 通过 `job.services.postgres.id` 定位容器，用 `docker exec -i` 在容器里运行 `psql`。Runner 从仓库读取迁移 SQL 并通过标准输入传入，`ON_ERROR_STOP=1` 让 SQL 出错时立即失败。
+- **Run Go integration tests** 在 Runner 上设置 `TEST_DATABASE_URL`、`TEST_REDIS_ADDR`，带 `integration` 标签执行下节命令。这里的环回地址指 Runner，因此要匹配服务端口映射。
+
+## 80. 本地验证记录与开发心得
+
+2026-11-21 的本地终端日志显示，以下命令选中的 **13 个测试全部通过**。其中 Repository 4 个、Redis Cache 5 个、Service 4 个（包含 3 个普通测试和 1 个 Cache Aside 集成测试）。
+
+```powershell
+go test -v -count=1 -tags=integration ./day9/internal/repository ./day9/internal/cache ./day9/internal/service
+```
+
+Cache Aside 日志出现两次数据库回源，分别对应初始 Miss 和更新使缓存失效后的再次查询。两次回源之间的读取命中旧缓存。以上是本地真实服务运行记录。GitHub Actions 上的集成 Job 仍需在推送后查看建表与测试日志。
+
+开发时将测试与行为一起交付。新增查询先测读回，加入事务再测成功提交和关键回滚，加入乐观锁时再测旧版本冲突。测试先准备数据，再调用待测入口，最后比较预期和实际。预期发生的业务错误也是通过条件，只有观察到的结果偏离预期才用 `t.Errorf` 或 `t.Fatalf` 报告失败。
