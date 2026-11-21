@@ -62,6 +62,7 @@ func (c *TaskCache) GetResult(ctx context.Context, id int64) (TaskCacheResult, e
 	key := taskKey2(int(id))
 	data, err := c.client.Get(ctx, key).Bytes()
 	if errors.Is(err, ErrCacheMiss) {
+		// 没有这个key
 		return TaskCacheResult{
 			Hit:    false,
 			Exists: false,
@@ -85,7 +86,7 @@ func (c *TaskCache) GetResult(ctx context.Context, id int64) (TaskCacheResult, e
 			Task:   model.Task{},
 		}, err
 	}
-	if !entry.Exists {
+	if !entry.Exists { // 有key但存入的是用SetNotFound，空值标记
 		return TaskCacheResult{
 			Hit:    true,
 			Exists: false,
@@ -94,6 +95,7 @@ func (c *TaskCache) GetResult(ctx context.Context, id int64) (TaskCacheResult, e
 	if entry.Task == nil || entry.Task.ID != id {
 		return TaskCacheResult{}, fmt.Errorf("任务缓存内容无效：id=%d", id)
 	}
+	// key存在且data不是空值
 	return TaskCacheResult{
 		Hit:    true,
 		Exists: true,

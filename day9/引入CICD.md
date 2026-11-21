@@ -2,7 +2,7 @@
 
 记录日期：2026-11-12。
 
-最新补充：2026-11-18，第 54～65 节记录 GitHub Actions 基础 CI、分支与 PR、质量检查、运行排错和概念问答。此前章节保留历史状态；当前 CI 进展与验证边界见第 65 节。
+最新补充：2026-11-20，第 66～72 节记录 Go 单元测试、集成测试隔离、竞态检测、缓存验证和 PR 排错。第 54～65 节保留 2026-11-18 的基础 CI 记录。
 
 后续补充：2026-11-13，第 14～23 节记录迁移管理、备份恢复、日志、健康检查和优雅退出。2026-11-16，第 24～34 节补充项目工程规范、Docker 多阶段构建、Compose 运行、交付及 Git 管理；第 35～41 节补充镜像瘦身、非 root 运行、Linux 权限及 docker run 环境变量引号问题。2026-11-17，第 42～47 节补充健康检查，第 48～53 节补充 API 容器安全配置、YAML 列表、Compose 构建、镜像标签与空间管理。前文保留当时的排查过程；最新配置核对结果与验收边界以第 53 节为准。
 
@@ -2201,3 +2201,94 @@ PostgreSQL、Redis 是 Compose 中另外的容器，不在 API 镜像里。修�
 - [actions/setup-go](https://github.com/actions/setup-go)
 - [gofmt 文档](https://pkg.go.dev/cmd/gofmt)
 - [GitHub Actions 计费](https://docs.github.com/zh/billing/concepts/product-billing/github-actions)
+
+## 66. Config 单元测试：先准备，再调用，最后断言
+
+测试文件为 `day9/internal/config/config_test.go`。这组测试直接调用 Go 函数，使用虚构连接串，无需启动 PostgreSQL 或 Redis。断言是比较实际结果和预期结果，不符合就用 `t.Errorf` 或 `t.Fatalf` 报告失败。前者记录失败并继续，后者结束当前测试或子测试。
+
+| 函数 | 作用 |
+| --- | --- |
+| `validConfig` | 创建合法配置，供每个校验场景独立修改，也提供默认值测试的预期结果 |
+| `TestValidate` | 覆盖合法输入、空 DSN、连接数边界、负数 Redis DB、非正数启动超时 |
+| `prepareLoadEnv` | 用 `t.Chdir(t.TempDir())` 避开本地 `day9/.env`，再用 `t.Setenv` 控制配置输入 |
+| `TestLoadDefaults` | 验证非必需环境变量为空时使用默认值 |
+| `TestLoadValidEnv` | 验证字符串输入能转换成目标字段，例如 `"1500ms"` 转成 `time.Duration` |
+| `TestLoadInvalidEnv` | 验证无效时间、连接数溢出和不合法取值等会报错 |
+
+表驱动测试把各场景放在切片里，共用执行和断言逻辑。字段 `change func(*Config)` 保存修改函数，`tt.change(&cfg)` 才执行修改。每个场景只改变需要验证的输入，避免先被其他校验条件拦住。
+
+`t.Run(name, fn)` 创建具名子测试，能逐项看结果。曾经把循环直接写在 `TestValidate` 里，第一条正常配置通过后执行 `return`，导致后面的场景没跑。放到 `t.Run` 的匿名函数里后，`return` 只结束当前子测试。`t.Helper()` 则让测试框架报告错误位置时跳过辅助函数。工作目录和环境变量是进程级状态，因此使用 `t.Chdir`、`t.Setenv` 的测试及其祖先不要调用 `t.Parallel()`。
+
+## 67. Token Bucket：用指定时间测试补充令牌
+
+`TestTokenBu` 创建速率为每秒 10 个令牌、突发容量为 3 的桶，依次断言初始 3 个令牌可取、同一时刻再次取令牌被拒绝、模拟推进 150ms 后可以取到一个令牌。`AllowN(now.Add(...), n)` 将指定时间传给限流器，测试无需真的等待。
+
+`if !limiter.AllowN(...) { t.Fatal(...) }` 断言应当放行；`if limiter.AllowN(...) { t.Fatal(...) }` 断言应当拒绝。`t.Fatal` 都位于实际结果偏离预期的分支里。这组测试验证令牌桶行为。业务构造器的容量是 5，且业务限流作用在缓存未命中后的数据库回源路径。
+
+## 68. Singleflight：控制重叠窗口，验证一次回调
+
+同一个 `Group` 中，同 key 且执行时间重叠的调用共享一次工作。回调结束后再次请求同 key，可以重新执行。`Shared` 表示这次结果是否有多个调用者收到，首个调用者也可能得到 `true`。
+
+原 `TestSingleflightSameKey` 用开始 Channel 放行 goroutine、用 WaitGroup 等待结束，并用 `Sleep(100ms)` 给后续调用注册留时间。连续 50 次未观察到失败，但开始信号只能保证调用可以继续，不能保证它们已经进入 `Do`。加长 Sleep 仍然依赖调度时机。
+
+`TestSingleflightSameKeyDoChan` 用 `release` 控制完成时机。先注册 20 次同 key 调用，将每次返回的只接收 Channel 存入切片，再关闭 `release`。然后从每个 Channel 接收一次并检查数据、错误和 `Shared`，最后断言回调计数为 1。回调是模拟回源，真实数据库查询次数需另外在 Service 层验证。
+
+曾把 `close(release)` 和结果收集放进注册循环，导致只注册了调用 0，它的结果未被共享。其余位置仍为 nil Channel，读取调用 1 时超时。修复后，注册和接收是两个独立循环。结果 Channel 由 `DoChan` 返回且不会被关闭，接收一次即可。
+
+```powershell
+go test -count=20 -run '^TestSingleflightSameKey$' ./day9/internal/service
+go test -count=100 -timeout=60s -run '^TestSingleflightSameKeyDoChan$' ./day9/internal/service
+```
+
+`-count` 是重复执行测试的次数，和每轮测试里的调用数相互独立。`-run` 两端的锚点用于精确匹配测试名。
+
+## 69. Build Tags 与手动集成测试
+
+`//go:build` 放在文件头，与 `package` 之间留一个空行。`// go:build` 在斜杠后多了空格，Go 会把它当普通注释。标签控制整个文件是否参与构建。启用标签时，符合条件的无标签测试也会参与。
+
+在提交 `00d20c7` 中，`task_test.go` 和 `Redis_stop_situation_test.go` 使用 `//go:build integration`。整理笔记时，这两个文件的本地未提交版本已改为 `//go:build integration && manual`，因此本地版本需要同时传入 `-tags=integration,manual`。
+
+| 用例 | PostgreSQL | Redis |
+| --- | --- | --- |
+| `TestConcurrentCacheMiss` | 需要任务 ID 12 | 必须可用 |
+| `TestRandomTTL` | 需要任务 ID 11–61 | 本机 `127.0.0.1:6379` 必须可用 |
+| `TestRedisStop` | 需要任务 ID 11–61 | 允许不可用，以观察回源 |
+
+必要的配置或连接失败用 `t.Fatalf` 结束测试，避免只打印日志并返回造成假通过。工作 goroutine 中可用 `t.Errorf` 再返回。`TestRedisStop` 目前允许 Redis 连接失败，但没有主动制造故障，因此在 Redis 正常时通过无法证明故障回源路径已执行。
+
+```powershell
+go test -count=1 ./day9/...
+go test '-tags=integration,manual' ./day9/internal/service -list '^Test(ConcurrentCacheMiss|RandomTTL|RedisStop)$'
+```
+
+第二条只编译并列出用例，实际运行前需要准备测试依赖和数据。
+
+## 70. CI 新增单元测试与 Race Detector
+
+```yaml
+- name: Run Go unit tests
+  run: go test -count=1 ./day9/...
+
+- name: Run Go tests with race detector
+  run: go test -race -count=1 ./day9/...
+```
+
+`./day9/` 只选根包，可能显示 `[no test files]` 并成功退出；`./day9/...` 会覆盖子包。两个步骤都没有启用集成测试标签。竞态检测会在测试执行路径上找出未同步的并发读写，发现时报告 `WARNING: DATA RACE` 并让步骤失败。
+
+`setup-go@v7` 默认启用依赖和构建缓存。项目未设置 `cache-dependency-path`，缓存键使用根目录 `go.mod` 的哈希作为一部分。在相同配置的前后两次 CI 运行中，看 `Set up Go` 是否恢复缓存，若未命中则看成功运行的 `Post Set up Go` 是否保存。用日志确认缓存命中，运行时长只能作为参考。测试命令的 `-count=1` 关闭测试结果复用，仍可使用依赖和编译缓存。
+
+## 71. 从 push 到 Checks：按 PR 状态和提交号排查
+
+`git add` 暂存文件当时的内容，`git commit` 将暂存内容记录到本地分支，`git push` 上传已有提交。若暂存后又编辑同一文件，需要再次暂存才能提交最新版本。VS Code 的 GitHub Actions 扩展可以检查 YAML 和查看日志，实际运行由 GitHub Runner 执行。
+
+工作流只监听 `main` 的 push 和目标为 `main` 的 PR。PR #1 合并后，再向 `ci/github-actions` 推送 `15bae2c`，当时没有打开的 PR 接收该提交，因此需要新建 PR #2。PR #2 保持打开时，推送后续提交会触发该 PR 的 `synchronize` 事件。同一分支是否首次推送、这次是否修改工作流 YAML，都不是这里的判断条件。
+
+PR #2 的第 #3 次运行因 `TokenBucket_test.go` 未格式化在 gofmt 步骤失败，后续检查被跳过。将文件格式化并提交为 `00d20c7` 后，已核对远程分支和 PR #2 的 head 均指向这个提交，用户随后确认新运行成功。旧运行的详情页仍显示当时的失败记录。排查时返回 PR 的 Checks 或仓库 Actions 列表，按最新提交号找对应运行。
+
+## 72. 合并前确认改动范围和验证范围
+
+- 最新 PR 检查应对应当前提交。用户已确认格式化修复后的新运行成功，缓存是否命中仍需按第 70 节独立查看日志。
+- 本地运行 `go test -count=1 ./...` 时，`day9` 通过；全仓库测试因已有的 `leetcode/alpha_diff_position.go` 缺少 `package` 声明而失败。当前 CI 使用 `./day9/...`，所以该问题可以单独处理。
+- CI 分支差异还包含新增的 `leetcode/3无重复字符的最长子串.cpp`。它与上面的 Go 报错是两件事。合并前在 `Files changed` 确认是否有意一并提交；若误带，移除后再查看新的 Checks。
+
+参考：[Go 构建约束](https://pkg.go.dev/cmd/go#hdr-Build_constraints)、[Singleflight](https://pkg.go.dev/golang.org/x/sync/singleflight)、[setup-go 缓存说明](https://github.com/actions/setup-go#caching-dependency-files-and-build-outputs)、[GitHub Actions 触发事件](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request)。
