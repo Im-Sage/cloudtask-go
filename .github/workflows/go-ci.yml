@@ -2,17 +2,22 @@
 name: CloudTask Go CI
 
 # 触发条件：监听main分支的push，以及目标为main的PR
+# 新加触发条件：推送Git版本标签作为发布这一版本镜像的信号
 on:
   push:
-    branches:
-      - main
+    branches: [main]
+    tags: ['v*']
   pull_request:
-    branches:
-      - main
+    branches: [main]
 
 # 权限设置
 permissions:
+  # 读取仓库代码
   contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: im-sage/cloudtask-api
 
 # 工作流中包含的任务
 jobs:
@@ -164,3 +169,55 @@ jobs:
               test -f /app/cloudtask-api
               test -x /app/cloudtask-api
              '
+
+  publish:
+      name: Publish Docker Image
+      # 因为这个Job有自己的runner，所以需要重新检出源码
+      runs-on: ubuntu-latest
+      needs: [quality, integration, docker-build]
+      timeout-minutes: 15
+
+      permissions:
+        # 读取仓库源码
+        contents: read
+        # 推送GHCR镜像
+        packages: write   # 必须写全，负责其余的权限都会设为none
+      # 只有当事件时push，并且推送的目标是main分支或以v开头的Git标签时，才执行这个job
+      if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+
+      steps:
+        - name: Checkout Code
+          uses: actions/checkout@v7
+          with:
+            persist-credentials: false
+
+        - name: Login to GHCR
+          uses: docker/login-action@v4
+          with:
+            registry: ${{ env.REGISTRY }}
+            username: ${{ github.actor }}
+            password: ${{ secrets.GITHUB_TOKEN }}
+        
+        # 准备好后续构建镜像用的Buildx构建器
+        - name: Set up Docker Buildx
+          uses: docker/setup-buildx-action@v4
+        
+        # 根据镜像仓库名和本次Git事件，生成完整的镜像标签
+        - name: Extract Docker Metadata
+          id: meta
+          uses: docker/metadata-action@v6
+          with:
+            images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+            flavor: latest=false
+            tags: |
+              type=ref,event=branch
+              type=ref,event=tag
+
+        - name: Build and Push
+          uses: docker/build-push-action@v7
+          with:
+            context: .
+            file: ./day9/Dockerfile
+            push: true
+            tags: ${{ steps.meta.outputs.tags }}
+            labels: ${{ steps.meta.outputs.labels }}

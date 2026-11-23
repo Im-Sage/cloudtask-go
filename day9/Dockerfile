@@ -30,7 +30,7 @@ RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories
 # 创建 app 用户组和用户
 RUN addgroup -S -g 10001 app && adduser -S -D -H -u 10001 -G app app
 
-
+LABEL org.opencontainers.image.source="https://github.com/Im-Sage/cloudtask-go"
 
 # 设置运行阶段的自己的工作目录
 WORKDIR /app
