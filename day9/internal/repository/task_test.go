@@ -33,6 +33,17 @@ func newRepository(t *testing.T) *pgxpool.Pool {
 	if pgCfg.DSN == "" {
 		t.Fatalf("配置读取错误:未设置DSN")
 	}
+
+	const testDBName = "cloudtask_test"
+
+	parsed, err := pgxpool.ParseConfig(pgCfg.DSN)
+
+	if err != nil {
+		t.Fatal("无法解析 TEST_DATABASE_URL，请检查连接串格式")
+	}
+	if dbName := parsed.ConnConfig.Database; dbName != testDBName {
+		t.Fatalf("测试要求使用数据库 %q，当前配置指向 %q", testDBName, dbName)
+	}
 	// 设置超时和取消时间
 	dbCtx, dbCancel := context.WithTimeout(
 		context.Background(),
@@ -48,6 +59,7 @@ func newRepository(t *testing.T) *pgxpool.Pool {
 
 func TestCreateAndGetTask(t *testing.T) {
 	pool := newRepository(t)
+	t.Cleanup(pool.Close)
 	ctx, cancel := context.WithTimeout(
 		context.Background(),
 		3*time.Second,
@@ -65,6 +77,13 @@ func TestCreateAndGetTask(t *testing.T) {
 	if err != nil {
 		t.Fatalf("查询失败：%v", err)
 	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := pool.Exec(cleanupCtx, "DELETE FROM tasks WHERE id = $1", taskGet.ID); err != nil {
+			t.Errorf("删除测试任务 %d 失败：%v", taskGet.ID, err)
+		}
+	})
 	// 判断版本是否正确，插入时默认版本是1
 	// 继续断言返回的ID、标题等于传入值，状态是否为pending
 	if taskGet.Version != 1 {
@@ -79,7 +98,6 @@ func TestCreateAndGetTask(t *testing.T) {
 	if taskGet.ID != task.ID {
 		t.Fatalf("任务ID错误")
 	}
-	t.Cleanup(pool.Close)
 }
 
 func TestChangeStatusWritesEvent(t *testing.T) {
@@ -96,6 +114,13 @@ func TestChangeStatusWritesEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("任务创建失败：%v", err)
 	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := pool.Exec(cleanupCtx, "DELETE FROM tasks WHERE id = $1", task.ID); err != nil {
+			t.Errorf("删除测试任务 %d 失败：%v", task.ID, err)
+		}
+	})
 
 	// 调用ChangeStatus
 	if err := repository.ChangeStatus(ctx, task.ID, "in_progress"); err != nil {

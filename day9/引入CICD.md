@@ -2390,3 +2390,76 @@ go test -v -count=1 -tags=integration ./day9/internal/repository ./day9/internal
 Cache Aside 日志出现两次数据库回源，分别对应初始 Miss 和更新使缓存失效后的再次查询。两次回源之间的读取命中旧缓存。以上是本地真实服务运行记录。GitHub Actions 上的集成 Job 仍需在推送后查看建表与测试日志。
 
 开发时将测试与行为一起交付。新增查询先测读回，加入事务再测成功提交和关键回滚，加入乐观锁时再测旧版本冲突。测试先准备数据，再调用待测入口，最后比较预期和实际。预期发生的业务错误也是通过条件，只有观察到的结果偏离预期才用 `t.Errorf` 或 `t.Fatalf` 报告失败。
+
+## 81. 把 CloudTask 镜像构建加入 CI（2026-11-21）
+
+提交 `0eaf8e0` 在 [go-ci.yml](../.github/workflows/go-ci.yml) 中新增了 `docker-build` Job。它声明 `needs: [quality, integration]`，等 Go 质量检查和集成测试都通过后，再验证仓库中的 [Dockerfile](Dockerfile) 能否把这次提交打包成镜像。
+
+**为什么还要写一次 `runs-on` 和 checkout？** GitHub 托管的 `ubuntu-latest` 按 Job 分配临时 Runner。即使三个 Job 选了同一个标签，也是各自拿到一台干净的机器。`needs` 建立执行依赖，前一个 Job 的工作目录不会自动传过来，所以 `docker-build` 要重新检出源码。集成测试的 PostgreSQL、Redis 服务容器也随其 Job 结束而清理。同一 Job 内的各个 Step 则共享工作目录和本地 Docker 镜像，后面的 Step 可以直接使用刚构建的 `cloudtask-api:ci`。
+
+| Step | 在这一步看什么 |
+| --- | --- |
+| Checkout code | 取得本次构建的源码、模块文件和 Dockerfile。 |
+| Check Docker environment | `docker version` 能输出客户端和服务端信息，说明 Runner 可以连接 Docker 引擎。 |
+| Build image | 从仓库根目录构建，并给本地镜像打上 `cloudtask-api:ci` 标签。 |
+| Inspect image | 打印镜像配置，预期看到用户 `10001:10001`、工作目录 `/app` 和启动命令 `["/app/cloudtask-api"]`。这一步供查看，命令本身没有比较字段值。 |
+| Container smoke test | 真正启动一个临时容器，用 `test` 断言实际 UID、GID、程序文件类型和执行权限。 |
+
+## 82. 构建上下文与 COPY 的两个路径
+
+在包含 `go.mod` 的 `cloudtask-go` 根目录执行下面这条命令，本地和 CI 使用相同的路径关系。
+
+```powershell
+docker build -f day9/Dockerfile -t cloudtask-api:ci .
+```
+
+`-f day9/Dockerfile` 选择构建指令文件，末尾的 `.` 选择构建上下文。对于这次本地目录构建，可以把上下文理解为从当前目录提供给构建器的一组文件，并受 `.dockerignore` 的排除规则约束。普通 `COPY` 的源路径从上下文根目录查找，目标路径在当前镜像阶段内解析。
+
+| Dockerfile 中的例子 | 源在哪里 | 目标在哪里 |
+| --- | --- | --- |
+| `COPY go.mod go.sum ./` | 仓库根目录的两个文件 | `builder` 的 `WORKDIR /cloudtask`，得到 `/cloudtask/go.mod` 和 `/cloudtask/go.sum` |
+| `COPY day9 /cloudtask/day9/` | 上下文中的 `day9` 目录内容 | `builder` 中的绝对路径 `/cloudtask/day9/` |
+| `COPY --from=builder … /out/cloudtask-api /app/cloudtask-api` | `builder` 文件系统中的编译产物 | `runtime` 文件系统中的 `/app/cloudtask-api` |
+
+如果先 `cd day9` 再执行 `docker build .`，上下文就缩小到了 `day9`，根目录的 `go.mod` 和 `go.sum` 随之落到上下文之外。这解释了为什么命令要同时保留 `-f day9/Dockerfile` 和最后的 `.`。
+
+## 83. 两个构建阶段与 Go 编译参数
+
+第一阶段从 `golang:1.26` 开始，下载模块、复制源码，然后把 API 编译为 `/out/cloudtask-api`。第二阶段从 `alpine:3.23` 重新开始，只从前一阶段复制这一个程序，再配上运行时需要的证书和健康检查用的 `curl`。最终镜像省去了 Go 工具链、源码和模块下载缓存，这才是多阶段构建能够减小体积的原因。
+
+| 编译设置 | 在 CloudTask 中的作用 |
+| --- | --- |
+| `CGO_ENABLED=0` | 编译时禁用 cgo。当前项目可以用纯 Go 构建，便于把二进制复制到精简的运行镜像中。若以后加入必须通过 cgo 调用 C 库的依赖，需要重新评估。 |
+| `GOOS=linux` | 指定目标操作系统为 Linux，对应最终的 Alpine 容器。目标 CPU 架构由 `GOARCH` 控制。 |
+
+## 84. 读懂构建缓存与跨 Runner 复用
+
+**看日志怎么判断？** BuildKit 的某一步出现 `CACHED`，表示复用了该步已有的结果。在本地给上述构建命令加上 `--progress=plain`，连续执行两次，就可以逐步对照。Docker 会匹配指令、前序构建结果和该步输入。对 `COPY` 来说，被复制文件的内容或权限变化都可能让缓存失效。
+
+假设基础镜像相同、缓存仍在，当前 Dockerfile 的指令顺序会带来两个典型结果。
+
+- **只改 `day9` 下的一行 Go 代码。** 模块文件没变，前面的 `go mod download` 可以命中缓存。从 `COPY day9 …` 开始，复制源码和随后的编译重新执行。
+- **修改 `go.mod` 的依赖版本。** 前面的 `COPY go.mod go.sum ./` 输入就变了，依赖下载和后续编译都需要重跑。
+
+**Runner 用完即毁，缓存还能保留吗？** 可以把缓存放到 Runner 外面。目前工作流直接执行 `docker build`，尚未配置跨次构建的 Docker 缓存。`setup-go` 管理的 Go 缓存和 Docker 镜像构建缓存各有各的用途。
+
+以后若切换为 Buildx 和 `docker/build-push-action`，可以用 `cache-to: type=gha,mode=max` 把本次构建缓存导出到 GitHub Actions 缓存服务，再用 `cache-from: type=gha` 在下次构建时读取。若同一 Job 后续仍要用本地 `docker run` 验证单平台镜像，还要让构建步骤把镜像载入 Runner 的 Docker，例如设置 `load: true`。[Docker 官方缓存示例](https://docs.docker.com/build/ci/github-actions/cache/)
+
+## 85. 构建成功、冒烟测试通过和 API 就绪分别说明什么
+
+`docker build` 成功说明编译和镜像组装完成。`CMD ["/app/cloudtask-api"]` 在构建时写入镜像配置，真正执行要等到容器按默认命令启动。
+
+本次 smoke test 使用 `docker run --rm --entrypoint /bin/sh`，由容器内的 Shell 依次执行检查。`id` 和 `ls -l` 打印诊断信息，`test` 检查 UID、GID 均为 `10001`，且 `/app/cloudtask-api` 是普通文件并具有执行权限。`/bin/sh -ec` 会在这里任一断言失败时以非零状态退出，CI Step 随之失败。`--rm` 在退出后清理容器。
+
+**为什么检查非 root？** CloudTask 只需要读取并执行程序。镜像将程序设为 `root:root` 所有、权限 `0555`，再用 `USER 10001:10001` 运行。应用用户可以启动程序，但不能直接改写该文件。以后若误删 `USER` 指令，UID 断言就能发现默认用户变成了 root。
+
+**这次测试覆盖到哪一层？** 它验证了容器用户和文件权限。因为启动的是 Shell，API 进程、数据库连接和 HTTP 请求都没有在这一步运行。要验证服务就绪，需要提供启动配置与测试依赖，按默认命令启动 API，再请求 `/readyz`。
+
+## 86. 健康检查与镜像发布
+
+| 概念 | 用 CloudTask 理解 |
+| --- | --- |
+| Docker `HEALTHCHECK` | Docker 按镜像里的指令，在容器内用 `curl` 访问 `127.0.0.1:8080/readyz`，根据结果记录容器健康状态，可通过 `docker inspect` 查看。 |
+| Kubernetes `readinessProbe` | 将来部署时，可以在 Pod 配置中显式指定同一个 `/readyz`。探测持续失败达到阈值时，Pod 变为未就绪，常规 Service 暂停向它分发新流量；就绪恢复后再接入。单独就绪探测失败不会重启容器。 |
+
+**为什么 PR 的构建只标记 `cloudtask-api:ci`？** `docker build -t` 给本地镜像命名，方便后续检查。生产仓库的 `latest` 是一个可移动的标签。若每个 PR 都向它推送，最后完成的构建就可能让 `latest` 指向尚未合并的代码。当前 Job 只做验证。发布阶段可以给已通过验证的镜像附上版本号或提交 SHA 标签，再按发布约定更新 `latest`，便于追踪上线内容。
