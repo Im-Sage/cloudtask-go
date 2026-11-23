@@ -34,17 +34,16 @@ func newRepository(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("配置读取错误:未设置DSN")
 	}
 
-	const testDBName = "cloudtask-test"
+	const testDBName = "cloudtask_test"
 
 	parsed, err := pgxpool.ParseConfig(pgCfg.DSN)
 
 	if err != nil {
-    t.Fatal("无法解析 TEST_DATABASE_URL，请检查连接串格式")
-
-	if dbName := parsed.ConnConfig.Database; dbName != testDBName {
-    t.Fatalf("测试要求使用数据库 %q，当前配置指向 %q", testDBName, dbName)
+		t.Fatal("无法解析 TEST_DATABASE_URL，请检查连接串格式")
 	}
-
+	if dbName := parsed.ConnConfig.Database; dbName != testDBName {
+		t.Fatalf("测试要求使用数据库 %q，当前配置指向 %q", testDBName, dbName)
+	}
 	// 设置超时和取消时间
 	dbCtx, dbCancel := context.WithTimeout(
 		context.Background(),
