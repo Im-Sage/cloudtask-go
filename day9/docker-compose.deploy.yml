@@ -1,0 +1,5 @@
+services:
+  # 采用覆盖模式，并使用 !reset 删除原有字段(用于合并配置)
+  api:
+    image: ghcr.io/im-sage/cloudtask-api:${IMAGE_TAG:?必须设置 IMAGE_TAG}
+    build: !reset null  # 移除原本的本地构建配置

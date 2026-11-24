@@ -2,7 +2,7 @@
 
 记录日期：2026-11-12。
 
-最新补充（2026-11-21）：第 73～80 节记录 PostgreSQL、Redis 和 Cache Aside 集成测试、本地 Docker 环境及 GitHub Actions 配置。第 66～72 节是 2026-11-20 的单元测试与 PR 排错记录，第 54～65 节是 2026-11-18 的基础 CI 记录。
+最新补充（2026-11-24）：第 92 节更新了 v2.3.4 的镜像验收结果，第 93～96 节记录 Compose 部署、数据卷、回滚和环境变量模板。第 87～91 节记录 GHCR 发布流程与排错，第 81～86 节记录镜像构建与冒烟测试，第 73～80 节记录集成测试，第 54～72 节记录基础 CI、单元测试与 PR 排错。
 
 后续补充：2026-11-13，第 14～23 节记录迁移管理、备份恢复、日志、健康检查和优雅退出。2026-11-16，第 24～34 节补充项目工程规范、Docker 多阶段构建、Compose 运行、交付及 Git 管理；第 35～41 节补充镜像瘦身、非 root 运行、Linux 权限及 docker run 环境变量引号问题。2026-11-17，第 42～47 节补充健康检查，第 48～53 节补充 API 容器安全配置、YAML 列表、Compose 构建、镜像标签与空间管理。前文保留当时的排查过程；最新配置核对结果与验收边界以第 53 节为准。
 
@@ -2441,9 +2441,9 @@ docker build -f day9/Dockerfile -t cloudtask-api:ci .
 - **只改 `day9` 下的一行 Go 代码。** 模块文件没变，前面的 `go mod download` 可以命中缓存。从 `COPY day9 …` 开始，复制源码和随后的编译重新执行。
 - **修改 `go.mod` 的依赖版本。** 前面的 `COPY go.mod go.sum ./` 输入就变了，依赖下载和后续编译都需要重跑。
 
-**Runner 用完即毁，缓存还能保留吗？** 可以把缓存放到 Runner 外面。目前工作流直接执行 `docker build`，尚未配置跨次构建的 Docker 缓存。`setup-go` 管理的 Go 缓存和 Docker 镜像构建缓存各有各的用途。
+**Runner 用完即毁，缓存还能保留吗？** 可以把缓存放到 Runner 外面。第 81 节的 `docker-build` 直接执行 `docker build`，这个 Job 没有配置跨次构建的 Docker 缓存。`setup-go` 管理的 Go 缓存和 Docker 镜像构建缓存各有各的用途。
 
-以后若切换为 Buildx 和 `docker/build-push-action`，可以用 `cache-to: type=gha,mode=max` 把本次构建缓存导出到 GitHub Actions 缓存服务，再用 `cache-from: type=gha` 在下次构建时读取。若同一 Job 后续仍要用本地 `docker run` 验证单平台镜像，还要让构建步骤把镜像载入 Runner 的 Docker，例如设置 `load: true`。[Docker 官方缓存示例](https://docs.docker.com/build/ci/github-actions/cache/)
+后续新增的 `publish` 已采用 Buildx，在 `docker/build-push-action` 中用 `cache-to: type=gha,mode=max` 导出构建缓存，再用 `cache-from: type=gha` 读取。前面的 `docker-build` 仍用原命令在自己的 Runner 上构建和验证。若改用 Buildx 并要在同一 Job 用本地 `docker run` 验证单平台镜像，可以设置 `load: true`。[Docker 官方缓存示例](https://docs.docker.com/build/ci/github-actions/cache/)
 
 ## 85. 构建成功、冒烟测试通过和 API 就绪分别说明什么
 
@@ -2462,4 +2462,173 @@ docker build -f day9/Dockerfile -t cloudtask-api:ci .
 | Docker `HEALTHCHECK` | Docker 按镜像里的指令，在容器内用 `curl` 访问 `127.0.0.1:8080/readyz`，根据结果记录容器健康状态，可通过 `docker inspect` 查看。 |
 | Kubernetes `readinessProbe` | 将来部署时，可以在 Pod 配置中显式指定同一个 `/readyz`。探测持续失败达到阈值时，Pod 变为未就绪，常规 Service 暂停向它分发新流量；就绪恢复后再接入。单独就绪探测失败不会重启容器。 |
 
-**为什么 PR 的构建只标记 `cloudtask-api:ci`？** `docker build -t` 给本地镜像命名，方便后续检查。生产仓库的 `latest` 是一个可移动的标签。若每个 PR 都向它推送，最后完成的构建就可能让 `latest` 指向尚未合并的代码。当前 Job 只做验证。发布阶段可以给已通过验证的镜像附上版本号或提交 SHA 标签，再按发布约定更新 `latest`，便于追踪上线内容。
+**为什么 PR 的构建只标记 `cloudtask-api:ci`？** `docker build -t` 给本地镜像命名，方便后续检查。生产仓库的 `latest` 是一个可移动的标签。若每个 PR 都向它推送，最后完成的构建就可能让 `latest` 指向尚未合并的代码。这个 Job 只做验证。第 89 节的发布 Job 使用分支、版本和提交 SHA 标签，配置为跳过 `latest`。
+
+## 87. 从本地镜像到 GHCR Package
+
+![Docker 架构示意图：Client 发出 build、pull、run 请求，Host 上的 Daemon 管理镜像和容器，并从 Registry 拉取镜像。](docs/images/docker-client-host-registry.png)
+
+从上往下读图：在 PowerShell 输入命令的是 Docker Client，处理请求的是 Docker Host 上的 Daemon。蓝线 `build` 对应 CI 根据 Dockerfile 构建本地镜像 `cloudtask-api:ci`；绿线 `pull` 对应验收时从 GHCR 拉取 `cloudtask-api:2.3.4`；红线 `run` 对应冒烟测试用镜像创建并启动容器。发布 Job 的 `push` 与绿线的镜像传输方向相反：构建结果从 Runner 上传到 GHCR。
+
+以 `ghcr.io/im-sage/cloudtask-api:2.3.4` 为例，`ghcr.io` 是提供存储和分发服务的 Registry，`im-sage/cloudtask-api` 是其中的镜像仓库，对应 GitHub Packages 页面的一个容器 Package，`2.3.4` 是选择镜像版本的标签。源代码仓库 `Im-Sage/cloudtask-go` 保存 Go 代码、Dockerfile 和 workflow。把 Package 与源码仓库关联，方便从镜像找到源码，并管理仓库工作流对包的访问。
+
+| 操作 | 去哪里看结果 |
+| --- | --- |
+| `docker context show` 输出 `desktop-linux` | Windows 上的 Docker CLI 选中了 Docker Desktop 的 Linux 引擎。`docker version` 的 Client 和 Server 分别描述客户端与引擎，Go version 指编译相应程序时用的 Go 版本。 |
+| `docker image inspect cloudtask-api:2.3.3-health` | 读取当前引擎保存的本地镜像元数据。检查 ID、OS、架构和启动容器做冒烟测试分属不同步骤，后者见第 85 节。 |
+| `docker tag` 给镜像换一个名字 | 曾把 `ghcr.io` 拼成 `ghrc.io`。用正确名称再打标签后，本地两个名字可以对应同一个 IMAGE ID；旧标签仍在。 |
+| `docker push ghcr.io/im-sage/cloudtask-api:版本` | 把指定本地标签指向的镜像发布到 GHCR。同一 Package 下可以有多个版本，多个标签也可以指向同一份内容。 |
+
+[本地 Compose](docker-compose.yml) 的 API 保留 `build.context: ..` 和 `dockerfile: day9/Dockerfile`，可以从本地源码构建。`docker compose up --build` 明确要求启动前构建。Actions 的 `integration.services` 自行启动 PostgreSQL 和 Redis，镜像构建步骤直接使用 Dockerfile；发布成功也不会自动更新正在运行的 Compose 容器。
+
+## 88. 哪些事件检查代码，哪些事件发布镜像
+
+工作流在 `on` 中选择事件，在 Job 的 `if` 中决定是否发布。`github.event_name` 表示事件类型；对 push，`github.ref` 表示本次更新的完整 Git 引用。当前发布条件和事件规则可在 [go-ci.yml](../.github/workflows/go-ci.yml) 对照。
+
+| 操作 | GitHub 收到什么 | 预期行为 |
+| --- | --- | --- |
+| 推送 `cd/ghcr-publish`，尚无开放 PR | 开发分支 push | 没有命中 `push.branches: [main]`。 |
+| 创建或更新以 `main` 为目标的 PR | `pull_request`，打开的 PR 使用类似 `refs/pull/6/merge` 的引用 | 运行 CI，跳过 `publish`。此处 `branches: [main]` 匹配 PR 的目标分支。 |
+| 直接推送到 `main`，或在 GitHub 合并 PR 至 `main` | `push`，`refs/heads/main` | 前置检查通过后发布 `:main` 和提交 SHA 标签。 |
+| 推送 Git 标签 `v2.3.4` | `push`，`refs/tags/v2.3.4` | 前置检查通过后发布版本标签和提交 SHA 标签。仅在本地创建标签不会触发。 |
+
+```yaml
+if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+```
+
+一次运行只有一个 `github.ref`，所以分支和标签之间用 `||`。即使它们指向同一提交，推送分支和推送标签也是两次不同的引用更新。这个条件写在 Job 层，控制整个 `publish`。它允许任意匹配的版本标签；本次通过显式选择 `origin/main` 来确定发布哪份源码。
+
+## 89. 发布 Job 的五个步骤与标签规则
+
+`publish` 使用 `ubuntu-latest`，依赖 `quality`、`integration` 和 `docker-build`。顶层只给 `contents: read`；发布 Job 自己显式声明 `contents: read` 和 `packages: write`。Job 一旦声明自己的权限表，未列出的权限设为 `none`。`packages` 要写在 `permissions` 下，直接写在 `docker-build` 下会导致工作流校验失败。
+
+| Step | 在本项目里做了什么 |
+| --- | --- |
+| Checkout Code | 在发布 Runner 上检出触发事件对应的源码。`persist-credentials: false` 使后续 Git 命令无法复用 checkout 留下的凭据；稍后可独立登录 GHCR。 |
+| Login to GHCR | 用 `github.actor` 和本次 Job 的 `GITHUB_TOKEN` 登录 `ghcr.io`。本地 PowerShell 的 Docker 登录状态不会带到 Runner。 |
+| Set up Docker Buildx | 准备构建器。前面 `docker-build` 使用 Docker 自带的默认构建器，在自己的 Runner 运行 `docker run` 冒烟检查。`needs` 只传递执行依赖，发布 Job 会从同一提交重新构建。 |
+| Extract Docker Metadata | `images` 提供基础名 `ghcr.io/im-sage/cloudtask-api`。这一步根据 Git 事件算出完整镜像标签，并生成源码 revision 等标签元数据。`id: meta` 供下一步读取输出。 |
+| Build and Push | 从仓库根目录 `.` 取上下文，用 `day9/Dockerfile` 构建 `linux/amd64` 镜像。读取 `steps.meta.outputs.tags` 和 `steps.meta.outputs.labels`，通过 `push: true` 上传。 |
+
+曾把 `cache-from` 和 `cache-to` 放在 setup 步骤。两者都是构建时参数，应放在 `docker/build-push-action` 的 `with` 下。提交 `11b9f02` 将缓存、目标平台和以下标签规则一起落地。缓存是否命中看构建日志中的 `CACHED`。
+
+| 规则 | 以提交 `fae7a8d` 为例的输出 |
+| --- | --- |
+| `type=ref,event=branch` | main 推送生成 `main`。 |
+| `type=ref,event=tag` | Git 标签 `v2.3.4` 生成同名镜像标签 `v2.3.4`。 |
+| `type=semver,pattern={{version}}` | 同一个 Git 标签额外生成 `2.3.4`。 |
+| `type=sha,prefix=sha-,format=short` | 两种发布事件均生成 `sha-fae7a8d`。 |
+
+本项目显式设置 `flavor: latest=false`。发布时使用版本号便于选版和回滚，SHA 标签方便按提交查找；需要固定镜像内容时记录 Registry 返回的 digest，用 `镜像名@sha256:…` 引用。[Docker 镜像标签规则](https://github.com/docker/metadata-action#tags-input)
+
+## 90. 两次权限问题与一次 Go 语法错误
+
+**本地登录返回 `denied`。** `Read-Host "请输入 GitHub PAT" -AsSecureString` 的引号里是提示语，提示出现后才粘贴令牌。把令牌写在提示语里会明文显示；一旦暴露，应在 GitHub 撤销并换新。更简单的手动验证是在 PowerShell 运行 `docker login ghcr.io --username Im-Sage`，在 `Password:` 处输入有 `write:packages` 权限的 PAT (classic)。这次交互登录观察到了 `Login Succeeded`。此前管道登录失败的具体原因未确定；即使更新了 `$secureToken`，已转换出的 `$plainToken` 也需要重新赋值。个人令牌无需写入 workflow。[GHCR 认证说明](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#authenticating-to-the-container-registry)
+
+**Actions 推送 `:main` 返回 `permission_denied: read_package`。** 先在失败运行的 `Set up job → GITHUB_TOKEN Permissions` 核对实际的 `Packages: write`，再到 `cloudtask-api → Package settings → Manage Actions access` 核对 `Im-Sage/cloudtask-go` 是否有 Write。此前若用个人令牌手动创建过同名包，个人有权推送并不自动授予仓库 workflow 写权限。若仅调整了 Package 权限，可重跑失败的 Job；给 workflow 重复添加 read 权限无法解决包侧授权。实际授权变更和重跑结果需以 GitHub 记录为准。[GitHub Package 权限](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility#ensuring-workflow-access-to-your-package)
+
+**PR #5 在格式检查阶段连续报五处语法错误。** 第一条指向 `TestCreateAndGetTask`，最后一条是 `expected '}', found 'EOF'`。根因在前一个函数 `newRepository`：`pgxpool.ParseConfig` 的 `if err != nil` 少了结束花括号，后续四个测试函数都被当成还在函数体内。修复提交 `f3fa1b2` 同时把预期库名从 `cloudtask-test` 改为工作流实际创建的 `cloudtask_test`。[Repository 测试辅助函数](internal/repository/task_test.go)
+
+`TEST_DATABASE_URL` 在 CI 的集成测试 Step 启动 `go test` 前由 `env` 注入。本地则在运行测试的 PowerShell 会话中赋值（见第 77 节）。Repository 测试先检查空串，再用 `parsed.ConnConfig.Database` 比较库名，匹配后才建连接池。复查语法和格式可在仓库根目录运行 `gofmt -l ./day9`。
+
+## 91. 本地 main、origin/main 和 GitHub 的 main
+
+在 `cd/ghcr-publish` 上执行 `git push -u origin cd/ghcr-publish` 后，本地分支跟踪远端同名分支。后续普通 `git push` 输出 `cd/ghcr-publish -> cd/ghcr-publish`；PR 合并后才会更新远端 main。以下三个书签的位置按本次 `git fetch origin --tags` 前后整理。
+
+| 位置 | PR #6 在 GitHub 合并后、本地 fetch 前 | fetch 后 |
+| --- | --- | --- |
+| GitHub 上的 `main` | `fae7a8d` | `fae7a8d` |
+| 电脑上的 `origin/main`（上次同步看到的位置） | `49364ae` | **`fae7a8d`** |
+| 电脑上的 `main`（可切换并开发的分支） | `49364ae` | `49364ae` |
+
+终端里的 `49364ae..fae7a8d  main -> origin/main` 表示远端信息已更新到本地记录。fetch 不会切换工作分支。此时用 `origin/main` 指定发布目标即可；若还想更新本地 main，可以切到 main 后执行 `git merge --ff-only origin/main`。
+
+## 92. 正式版本 v2.3.4 的发布与验收
+
+Git 标签固定这次选中的源码提交，GHCR 镜像标签用于拉取构建产物。两者通过第 89 节的 metadata 规则对应。下面按仓库根目录下的 PowerShell 操作编排。
+
+**选定提交。** 先运行 `git fetch origin --tags` 和 `git log -1 --oneline origin/main`。本次选中 PR #6 的合并提交 `fae7a8d`。本地现已有附注标签 `v2.3.4`，可以直接运行 `git rev-list -n 1 v2.3.4` 核对。下列第一条是当时这类发布使用的创建命令，已有标签时跳过。
+
+```powershell
+git tag -a v2.3.4 origin/main -m "Release v2.3.4"
+git push origin refs/tags/v2.3.4
+```
+
+**检查远端。** `git ls-remote --tags origin refs/tags/v2.3.4` 能查到远端标签是否存在。随后在 Actions 中选择由 `v2.3.4` 推送触发的运行，核对四个 Job 及 Build and Push 日志中的完整镜像名和 digest。即使 main 推送与标签推送使用同一个 SHA，两次运行生成的镜像标签也不同。
+
+**拉取并比对。** 发布成功后执行下列命令。Git 的完整提交号应与镜像的 `org.opencontainers.image.revision` 标签相同；`docker pull` 返回的 digest 应与版本发布日志中的镜像摘要相符。
+
+```powershell
+$image = 'ghcr.io/im-sage/cloudtask-api:v2.3.4'
+docker pull $image
+$info = docker image inspect $image | ConvertFrom-Json
+$info[0].Config.Labels.'org.opencontainers.image.revision'
+git rev-list -n 1 v2.3.4
+```
+
+**11 月 24 日验收结果。** 本机镜像 `ghcr.io/im-sage/cloudtask-api:v2.3.4` 的 revision 与 `git rev-list -n 1 v2.3.4` 都输出 `fae7a8d3c30993cb1c49e1ebc07912064f4c64d1`。GHCR 的同一版本页面列出 `v2.3.4`、`2.3.4`、`sha-fae7a8d` 三个标签。至此已确认镜像发布到了 GHCR，且本地镜像记录的源码提交与发布标签一致。
+
+| 遇到的问题 | 应该比较哪两个值 |
+| --- | --- |
+| 镜像由哪份源码构建？ | 镜像的 `org.opencontainers.image.revision` 与 Git 标签指向的提交 SHA。页面上的 `sha-fae7a8d` 是用该提交号前 7 位生成的镜像标签。 |
+| GHCR 页面为什么显示另一个 SHA？ | 页面上的 `Digest: sha256:14baf56f…` 标识镜像清单或索引的内容。可执行 `docker buildx imagetools inspect $image`，将输出顶部的完整 `Digest` 与页面摘要比较。 |
+
+## 93. Compose 部署覆盖与配置检查
+
+[基础配置](docker-compose.yml) 定义 API、PostgreSQL 和 Redis，本地开发时 API 可以用仓库里的 Dockerfile 构建。[部署覆盖文件](docker-compose.deploy.yml) 只改 API 的两个字段。两个文件合并后，API 使用 GHCR 中选定的版本，数据库、端口、健康检查和数据卷等设置沿用基础配置。
+
+```yaml
+services:
+  api:
+    image: ghcr.io/im-sage/cloudtask-api:${IMAGE_TAG:?必须设置 IMAGE_TAG}
+    build: !reset null
+```
+
+`!reset null` 清除基础配置中的 `build`。`${IMAGE_TAG:?...}` 要求版本值非空，避免忘记选版本时继续部署。在 **cloudtask-go 仓库根目录的 PowerShell** 中，把三组选项保存成数组，后续命令就能使用同一份配置：
+
+```powershell
+$dc = @(
+    '--env-file', 'day9/.env.docker',
+    '-f', 'day9/docker-compose.yml',
+    '-f', 'day9/docker-compose.deploy.yml'
+)
+docker compose @dc config --images
+```
+
+赋值只创建数组。`@dc` 在调用命令时展开参数，Compose 按两个 `-f` 的顺序合并配置。`--env-file` 提供 YAML 插值所需的变量；基础配置中 `api.env_file` 则把文件中的变量传给 API 容器。这两处恰好用了同一个文件。
+
+本次实际运行 `config --images` 列出 `ghcr.io/im-sage/cloudtask-api:v2.3.4`、`postgres:17` 和 `redis:8-alpine`。这验证了部署覆盖和版本选择。该命令只解析配置；查看正在运行的版本要用 `docker compose @dc ps`。
+
+## 94. 拉取镜像、启动容器与验证服务
+
+| 操作顺序 | 命令 | 检查什么 |
+| --- | --- | --- |
+| 1. 检查本机 GHCR 凭据 | `docker login ghcr.io` | 显示使用已保存凭据且随后出现 `Login Succeeded`，说明该凭据有效。若提示重新输入，可用 GitHub 用户名和 PAT (classic) 登录；拉取私有镜像需要相应的包读取权限。公开镜像允许匿名拉取。 |
+| 2. 拉取选定版本 | `docker compose @dc pull api` | `api` 是服务名。Docker 检查其 GHCR 镜像并下载缺少的层；正在运行的容器继续使用原版本。 |
+| 3. 应用部署配置 | `docker compose @dc up -d` | 启动所定义的服务，并按需要重建容器。数据库和 Redis 已就绪、只想更新 API 时可用 `docker compose @dc up -d --no-deps api`。 |
+| 4. 核对运行结果 | `docker compose @dc ps` 和 `curl.exe -f http://127.0.0.1:8080/readyz` | 在 `ps` 中看 API 镜像和容器状态，随后验证就绪接口；涉及业务改动时再验证相应请求。 |
+
+遇到“已改版本但仍运行旧容器”，依次检查上述三个位置：`config --images` 中的目标版本、本机已经拉取的镜像、`ps` 中正在运行的容器。这里记录的是部署验收方法；第 92 节的源码核对不能代替 HTTP 就绪检查。
+
+## 95. PostgreSQL 的表为何保留，API 如何回滚
+
+部署时没有手动执行迁移，却仍能看到原有表。本次检查到数据库容器 `day9-db-1` 将命名卷 **`day9_postgres_data`** 挂载至 **`/var/lib/postgresql/data`**。表、索引和数据都在这个卷上。覆盖文件只调整 API，即使数据库容器重建，挂回原卷也能读到旧表。可以用下面两条只读命令分别确认挂载和表结构：
+
+```powershell
+docker inspect (docker compose @dc ps -q db) --format '{{json .Mounts}}'
+docker compose @dc exec db psql -U app -d cloudtask -c '\d tasks'
+```
+
+**判断迁移是否生效，要看本次迁移预期改变的对象。** 例如升级脚本为 `tasks` 增加一列，就核对列名和类型；看到 `tasks` 本身只能说明这张表已经存在。当前部署配置没有执行迁移的步骤。
+
+**生产回滚可以由人决定、由流水线执行。** 小规模部署也可以由人手动切回旧版本；支持渐进式发布的平台可以根据健康检查或错误率阈值自动停止放量、切回稳定版。当前 Compose 配置没有自动切换版本的规则。
+
+CloudTask 的手动回滚方法：将 `day9/.env.docker` 中的 `IMAGE_TAG` 改成 GHCR 已发布、验证过的旧标签，执行 `config --images` 确认目标，再按第 94 节拉取和更新 API，检查 `/readyz` 及受影响的业务请求。若当前 PowerShell 设置了 `$env:IMAGE_TAG`，它会优先于文件值。**回滚 API 保留数据库当前结构**，若升级已删除旧版所需的列，切回旧镜像仍可能报错，应先核对旧版与现有 schema 的兼容性。本轮没有记录实际回滚演练结果。
+
+## 96. 分开维护宿主机与 Docker 的环境变量模板
+
+宿主机运行 Go 程序时，`.env.example` 用 `localhost` 或 `127.0.0.1` 访问映射出来的端口。Compose 网络里，API 应使用服务名 `db:5432` 和 `redis:6379`；部署覆盖文件还需要 `IMAGE_TAG`。因此单独维护 `.env.docker.example`，能让新环境按正确的地址和版本启动。模板只放占位值，实际凭据写入本机的 `.env.docker`。
+
+**本次文件状态。** 本地已有 `.env.docker.example`，其中有 `DATABASE_URL`、`REDIS_ADDR`、`REDIS_PASSWORD` 和 `IMAGE_TAG`；尚未显式列出 `POSTGRES_PASSWORD`。首次初始化新库时，建议在模板中写出这个变量，并让连接串使用相应密码。已有数据卷的数据库角色密码不会因为修改环境文件而自动更新。
+
+当前 `day9/.gitignore` 的 `.env.*` 同时忽略实际配置和 Docker 模板，只单独放行了 `.env.example`。若要让同学克隆后能拿到 Docker 模板，可在忽略规则后增加 `!.env.docker.example`。用 `git check-ignore -v day9/.env.docker.example day9/.env.docker` 核对规则，再用 `git status --short --untracked-files=all -- day9/.env.docker.example` 确认可提交的是示例文件。
