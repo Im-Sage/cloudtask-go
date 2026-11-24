@@ -1,81 +1,117 @@
-# CloudTask Go 学习项目
+# CloudTask Go
 
-本仓库按 `dayN` 目录保存 Go 练习。当前的 `day9` 是基于 Go、Gin、pgxpool 和 PostgreSQL 的任务管理 API，包含 CRUD、事务事件记录、悲观锁及乐观锁实验；`day8` 是 Worker Pool 并发练习。
+CloudTask 是一个用 Go、Gin、PostgreSQL 和 Redis 实现的任务管理 API。创建一个任务后，可以按 ID 查询、按状态分页，或带着上次读到的版本修改状态。项目用同一套任务数据演示三个问题：并发写入如何检测冲突，状态变更如何留下事件，缓存失效时怎样保护数据库。
 
-## day9：任务管理 API
+[综合学习笔记](docs/notes/cloudtask-handbook.md) · [接口示例](docs/api.md) · [架构与事务流程图](docs/architecture.md)
 
-- [运行与数据库初始化指南](day9/README.md)：环境准备、Docker Compose、已有数据库升级、启动及接口验证。
-- [接口文档](day9/docs/api.md)：全部路由、参数、响应及版本冲突行为。
-- [架构与事务流程图](day9/docs/architecture.md)：分层架构、数据库关系和并发更新时序。
+## 在本地启动
 
-从当前模块根目录运行：
+以下 PowerShell 命令在仓库根目录 `cloudtask-go` 执行。容器方式需要 Docker 和支持 `up --wait` 的 Compose v2，默认占用本机回环地址的 5432、6379 和 8080 端口。只有在宿主机上编译、测试或运行 Go 服务时，才需要安装与 [go.mod](go.mod) 匹配的 Go 工具链（模块声明为 1.26.0）。
 
-```powershell
-docker compose -f day9/docker-compose.yml up -d db
-docker compose -f day9/docker-compose.yml exec db pg_isready -U app -d cloudtask
-go run ./day9/cmd/server
-```
-
-第二条命令应显示数据库接受连接后再启动服务。首次启动会自动执行初始化 SQL；已有数据卷不会重新执行初始化脚本，具体处理见运行指南。
-
-API 地址为 `http://localhost:8080`。独立终端中可访问：
+### 1. 准备容器环境
 
 ```powershell
-Invoke-RestMethod http://localhost:8080/tasks
+if (!(Test-Path .env.docker)) { Copy-Item .env.docker.example .env.docker }
 ```
 
-当前只有 `PATCH /tasks/opm/:id` 检查版本冲突。普通 PUT 和悲观锁 PATCH 保留用于学习对比，不能将项目描述为“全部更新接口均已完成版本保护”。
-
-## day8：Worker Pool
-
-提交者通过 jobs Channel 发送任务，3 个 Worker 并发处理任务，再通过 results Channel 返回结果。以下保留 day8 的运行与测试说明。
-
-## 环境与目录
-
-- Go：使用 `go.mod` 声明的 Go 1.25.7。
-- `day8/main.go`：创建 Channel、启动 Worker、提交任务、收集结果，并设置 800 毫秒超时。
-- `day8/pool.go`：定义 `Job`、`Result` 和 Worker 的处理及取消逻辑。
-- `day8/pool_test.go`：验证正常任务、模拟错误和 10 个任务的结果收集。
-
-下面的命令都从仓库根目录 `cloudtask-go` 执行。如果 PowerShell 当前位于仓库的父目录，先进入该目录：
+打开 `.env.docker`，替换占位密码。让 `POSTGRES_PASSWORD` 与 `DATABASE_URL` 中的密码一致，容器内地址保留为 `db:5432` 和 `redis:6379`。已有数据卷时，使用库中现有的角色密码。下面的 `--env-file` 为 Compose 展开变量，配置中的 `api.env_file` 则把变量传入 API 容器。[容器配置模板](.env.docker.example) · [Compose 配置](docker-compose.yml)
 
 ```powershell
-cd .\cloudtask-go
+docker compose --env-file .env.docker config --quiet
+docker compose --env-file .env.docker up -d --wait db redis
+docker compose --env-file .env.docker exec db psql -U app -d cloudtask -c '\dt'
 ```
 
-## 运行 Worker Pool
+### 2. 首次为空库建表
+
+如果上一步显示没有关系表，在**新建的空库**执行一次基线迁移。它会在一个事务中创建 `tasks`、`task_events`、约束和索引。当前 Compose 只把命名卷挂到 PostgreSQL 的数据目录，启动服务不会自动执行仓库里的 SQL。[基线迁移](db/migrations/000001_init.up.sql)
 
 ```powershell
-go run ./day8
+Get-Content -Raw -Encoding UTF8 .\db\migrations\000001_init.up.sql | docker compose --env-file .env.docker exec -T db psql -v ON_ERROR_STOP=1 -U app -d cloudtask
 ```
 
-程序尝试提交 10 个任务，但演示程序设置了 **800 毫秒超时**；除 Job 1 的模拟错误外，普通任务各模拟处理 500 毫秒。因此这次运行通常只会输出部分任务的结果，随后打印提交者或 Worker 收到取消信号的消息，并正常退出。各 Worker 并发运行，日志顺序和取消前完成的任务数可能变化。
+已有业务表时跳过这条命令。可以用 `\d tasks` 和 `\d task_events` 对照基线检查列、约束和索引。如果重构后意外看到空库，先检查 Compose 项目名和挂载的卷；目录改名后，默认卷名可能随项目名改变，旧数据可能仍在原卷里。
 
-Job 1 被特意设为失败，用来展示 `Result.Error` 的处理；它应只产生一份错误结果。
-
-## 运行测试
+### 3. 启动 API 并验证
 
 ```powershell
-go test -v ./day8
+docker compose --env-file .env.docker up -d --build api
+docker compose --env-file .env.docker ps
+$api = 'http://127.0.0.1:8080'
+Invoke-RestMethod "$api/healthz"
+Invoke-RestMethod "$api/readyz"
+Invoke-RestMethod "$api/tasks?status=pending&limit=5&offset=0"
 ```
 
-现有测试覆盖：
+`/healthz` 返回 `{"status":"ok"}` 表示 HTTP 服务能响应。`/readyz` 会 Ping PostgreSQL，成功返回 `{"status":"ready"}`，失败返回 503。最后一个请求验证应用能查询任务表；空库返回空数组。如果刚启动就连接失败，可以先看 `docker compose --env-file .env.docker logs --tail 60 api db redis`。
 
-- 一个正常任务返回正确结果。
-- Job 1 返回错误结果。
-- 3 个 Worker 处理 10 个任务，并收集每个任务的结果。
+**在宿主机调试 Go 服务**时，只启动上面的 `db` 和 `redis` 并完成建表，把 `.env.example` 复制为 `.env`（已有文件可直接使用）。填写与容器相同的数据库和 Redis 凭据，主机改用 `localhost:5432` 和 `127.0.0.1:6379`。如果容器版 API 已占用 8080，先执行 `docker compose --env-file .env.docker stop api`。随后在根目录运行 `go run ./cmd/server`，按 Ctrl+C 退出。[宿主机配置模板](.env.example)
 
-测试使用自己的 Context 期限，**不会沿用 `main.go` 的 800 毫秒超时**。目前尚无专门断言“处理中的任务因超时退出”或“手动调用 `cancel()` 后退出”的自动化测试；当前演示程序展示的是超时取消，手动取消需要另写测试或在代码中触发 `cancel()`。
+## 从创建任务到观察版本冲突
 
-## 检查数据竞争
+在同一个 PowerShell 终端运行。使用创建响应里的 ID 和版本，这个实验可以在已有数据的开发库里重复做。
 
 ```powershell
-go test -race ./...
-go run -race ./day8
+$api = 'http://127.0.0.1:8080'
+$body = @{ title = 'Version check'; description = 'Try one stale update' } | ConvertTo-Json
+$task = Invoke-RestMethod -Method Post -Uri "$api/tasks" -ContentType 'application/json' -Body $body
+$task | Select-Object id, status, version
+
+$change = @{ status = 'completed'; expected_version = $task.version } | ConvertTo-Json
+$uri = "$api/tasks/opm/$($task.id)"
+$updated = Invoke-RestMethod -Method Patch -Uri $uri -ContentType 'application/json' -Body $change
+$updated.data | Select-Object id, status, version
 ```
 
-第一条命令运行整个模块的现有测试并启用 Race Detector；第二条命令检查 `day8` 演示程序实际走到的超时路径。正常情况下不应出现 `WARNING: DATA RACE`。Race Detector 只能检查本次运行实际执行到的代码路径，一次通过不代表所有可能的并发路径都已验证。
+新任务应从 `pending / 1` 变为 `completed / 2`。用同一份 `$change` 再发一次，会得到 **409 Conflict**。重新 GET 可以看到胜出的版本。在数据库中还可以核对这次变更的旧状态和新状态。
 
-## Channel 的关闭顺序
+```powershell
+try {
+    Invoke-RestMethod -Method Patch -Uri $uri -ContentType 'application/json' -Body $change
+} catch {
+    [int]$_.Exception.Response.StatusCode
+}
+Invoke-RestMethod "$api/tasks/$($task.id)"
+docker compose --env-file .env.docker exec db psql -U app -d cloudtask -c "SELECT event_type, details FROM task_events WHERE task_id = $($task.id) ORDER BY id"
+```
 
-提交者退出时关闭 `jobs`。提交者和所有 Worker 都调用 `wg.Done()` 后，另一个 goroutine 才关闭 `results`。主 goroutine 持续用 `range results` 接收结果，直到结果通道关闭；这样 Worker 在发送无缓冲结果时始终有接收方。
+| 入口 | 当前行为 |
+| --- | --- |
+| `POST /tasks`、`GET /tasks/:id`、`DELETE /tasks/:id` | 创建、查详情、删除；删除任务时数据库级联删除关联事件 |
+| `GET /tasks` | 默认 `pending`，按 ID 倒序；`limit` 默认 10、范围 1–100，`offset` 从 0 开始 |
+| `PUT /tasks/:id` | 更新标题和状态，递增版本，并写入 `task_updated` 事件 |
+| `PATCH /tasks/:id` | 加行锁后修改状态；请求体要求正数 `expected_version`，此入口只校验其格式 |
+| `PATCH /tasks/opm/:id` | 按客户端版本条件更新；成功返回 `data.version`，版本冲突返回 409 |
+
+支持的状态为 `pending`、`in_progress` 和 `completed`。当前 HTTP 路由没有鉴权，事件通过 SQL 查询。字段与错误映射可对照 [请求结构](internal/requestbody/task_request.go) 和 [Handler](internal/handler/task_handler.go)。
+
+## 构建与测试
+
+```powershell
+go build ./cmd/server
+go test ./...
+docker build -t cloudtask-api:refactor .
+```
+
+在 Windows 上，第一条命令默认在根目录生成 `server.exe`。第二条运行默认测试。缓存和仓储包的测试文件带有 `//go:build integration`，因此默认输出中的 `[no test files]` 是预期结果。第三条构建 Linux 镜像，服务启动和数据库访问可以用上面的 HTTP 请求另行验证。
+
+要运行集成测试，准备独立的 PostgreSQL 测试库 **`cloudtask_test`**，在该空库执行同一份基线迁移，并准备专用的 Redis 测试实例。在当前终端设置 `TEST_DATABASE_URL` 和 `TEST_REDIS_ADDR`；如 Redis 启用了认证，还需设置 `TEST_REDIS_USERNAME`、`TEST_REDIS_PASSWORD`。测试会写入任务、事件和缓存键。
+
+```powershell
+go test -v -count=1 -tags=integration ./internal/repository ./internal/cache ./internal/service
+```
+
+面向 `main` 的 PR 会运行格式检查、`go vet`、编译、默认测试、竞态检测、带 PostgreSQL/Redis 的集成测试，以及镜像构建和冒烟检查。检查通过后，推送到 `main` 或推送 `v*` 标签才进入 GHCR 发布步骤。需要使用已发布镜像或切换版本时，见综合笔记的“交付与回滚”。[工作流](.github/workflows/go-ci.yml) · [部署覆盖文件](docker-compose.deploy.yml)
+
+## 源码导航
+
+| 路径 | 从这里看什么 |
+| --- | --- |
+| [cmd/server](cmd/server/main.go) | 加载配置、组装依赖、构建过滤器、监听 HTTP 与优雅退出 |
+| [internal/handler](internal/handler/router.go) → [service](internal/service/task_service.go) → [repository](internal/repository/task_repository.go) | 从路由跟到参数校验、缓存编排、SQL 和事务 |
+| [internal/cache](internal/cache)、[internal/database](internal/database)、[internal/config](internal/config) | Redis 读写与布隆过滤器、pgx 连接池、配置加载及校验 |
+| [db/migrations](db/migrations) | 数据库基线及对应的回退 SQL |
+| [examples](examples) | 缓存和并发客户端的学习示例。乐观锁样例有固定 ID 和旧 JSON 字段，复现实验可直接使用上面的 PowerShell 请求 |
+| [docs/notes](docs/notes) | 综合笔记和各阶段的实验记录。早期按天组织的练习代码可在 `archive/learning-history` 分支查看 |
+
+结束实验时，执行 `docker compose --env-file .env.docker stop` 可以停止服务并保留数据库卷。
