@@ -142,3 +142,78 @@ PostgreSQL 保存任务事实，Redis 保存可丢弃的查询结果。当前详
 | Redis 超时以后连数据库也立即失败 | 检查是否把已超时的缓存子 Context 传给数据库。当前读取缓存有短预算，查库承接请求 Context。写后删除用 `WithoutCancel` 脱离请求取消，再设 100 ms 收尾期限。 |
 
 一个可观察的实验是先 GET 真实任务两次，让第二次命中缓存，再用 PATCH 改状态，再次 GET 核对新版本。要证明“同键回源合并”，得让多个请求在第一次回调完成前重叠，并统计回调或数据库查询次数。连续发两次 GET 只能观察缓存复用。[Redis 实验与故障记录](引入redis.md) · [缓存编码和 TTL](../../internal/cache/task_cache.go) · [Service 读取路径](../../internal/service/task_service.go)
+
+<a id="runtime"></a>
+
+## 七、启动配置、Docker 网络和数据的去向
+
+在宿主机上，`config.Load()` 从工作目录尝试加载 `.env`，读取进程环境，转换数字和时长，最后校验。例如 `PG_MIN_CONNS` 应在 0 到 `PG_MAX_CONNS` 之间，超时要写成 `500ms` 或 `5s`。在 IDE 里启动报缺少 `DATABASE_URL` 而终端正常，先看工作目录和实际使用的环境文件。读配置、创建客户端、Ping 成功是三个不同的观察点。[配置加载](../../internal/config/config.go)
+
+| 从哪里访问 | PostgreSQL / Redis 地址 | 为什么 |
+| --- | --- | --- |
+| 宿主机上运行的 Go 服务 | `localhost:5432` / `127.0.0.1:6379` | Compose 把这两个端口映射到了主机的回环地址 |
+| Compose 网络中的 API 容器 | `db:5432` / `redis:6379` | 服务名在网络内解析，容器里的 localhost 指向自己 |
+| API 容器的健康检查 | `127.0.0.1:8080/readyz` | 检查从容器内部发出，目标正是本容器的 HTTP 服务 |
+
+**从哪里读密码？** Compose 的 `--env-file .env.docker` 提供 YAML 中 `${...}` 的插值，服务上的 `env_file` 把变量传给 API 进程。配置中的 `$$REDIS_PASSWORD` 让变量留到容器内的 shell 展开。首次建库时角色密码要与 API 连接串一致；卷已经初始化后，修改环境文件不会更新库中角色的密码。[Compose 文件](../../docker-compose.yml)
+
+**重建后什么会保留？** 镜像包含程序和运行文件，容器是运行实例，PostgreSQL 把表、索引和行存入挂载的命名卷。OneNote 记录过把宿主机 `db/init` 只读挂到入口初始化目录的实验，这种方式也只在空数据目录首次生效。当前项目用迁移文件提供结构，Compose 没有该挂载。首次部署空库时执行基线；旧库先对照结构和备份。数据库备份记录某个时刻的数据，迁移记录结构如何演进。仅改 SQL 文件、重建 API 镜像或标记迁移版本，都不会自动补上库中缺失的列。[OneNote 第 4–5 页](../../go_grammer.pdf) · [建表与索引](../../db/migrations/000001_init.up.sql)
+
+**一次关闭如何收尾？** 主程序用一个 goroutine 运行 HTTP Server，通过带缓冲的错误 channel 报告监听失败，同时监听系统退出信号。收到信号后，用独立的 10 秒期限执行 `Shutdown`，让在途请求收尾；随后 `run` 返回并释放数据库与 Redis 客户端。HTTP 写超时、启动时 Ping 超时和关停期限分别约束不同阶段。容器的 `stop_grace_period` 是外层等待时间。
+
+<a id="tests"></a>
+
+## 八、测试究竟验证了哪一层
+
+| 观察方式 | 可以回答的问题 | CloudTask 中的例子 |
+| --- | --- | --- |
+| 单元测试 | 给定输入或时序，代码是否按预期分支执行？ | `config` 检查默认值与非法配置；令牌桶测试显式控制时间；同键测试控制并发重叠窗口 |
+| 数据库集成测试 | SQL、约束、提交和回滚在真实 PostgreSQL 中是否成立？ | 创建后读取、状态变更写事件、事件失败时回滚、旧版本冲突 |
+| 缓存和服务集成测试 | 真实 Redis 能否区分 miss、空值和任务？Service 回源后是否填入缓存？ | Redis 键的读取、删除、TTL 范围，以及 Service 的 Cache Aside 流程 |
+| 镜像冒烟检查 | 交付物里是否有可执行文件，默认用户对不对？ | CI 以 shell 进入镜像，检查 UID/GID 10001 和 `/app/cloudtask-api` 的权限 |
+| 运行时检查 | 服务是否能完成用户实际要做的事？ | `/healthz` 看 HTTP，`/readyz` 检查 PostgreSQL，创建或查询任务才会访问对应业务表 |
+
+从根目录先列出测试，再决定是否运行。下面第二条命令只枚举匹配的测试名；真正执行时去掉 `-list .`，并按 README 准备专用数据库和 Redis。
+
+```powershell
+go test ./...
+go test -tags=integration -list . ./internal/cache ./internal/repository ./internal/service
+```
+
+文件名要以 `_test.go` 结尾，并满足文件开头的 build tag。缓存与仓储包的测试需要 `integration`，部分人工实验同时要求 `integration && manual`。因此 `[no test files]` 只描述当前选择条件。`go test -race` 能发现这次运行实际触发的数据竞争；SQL 的并发覆盖和事务行为还需用两个客户端和真实数据库验证。[仓储测试](../../internal/repository/task_test.go) · [缓存测试](../../internal/cache/task_cache_integration_test.go) · [服务集成测试](../../internal/service/task_integration_test.go)
+
+**搬目录后的典型报错。** 如果 `go mod tidy` 输出 `repository.test imports .../day9/internal/config`，先搜测试里的旧 import。包路径由模块名和目录组成；改完 import 再 tidy，工具才会按新布局整理依赖。`go build ./cmd/server` 默认编译当前平台的入口；Dockerfile 在 builder 中编译 Linux 程序，再复制到运行镜像。从旧版示例复现 409 时，也要确认客户端发的是 `expected_version`：错误字段导致 400，尚未走到版本比较。
+
+<a id="delivery"></a>
+
+## 九、交付与回滚
+
+从改一行代码到容器跑起来，涉及三个独立标识：Git 提交号标识源码，镜像标签或 digest 标识构建物，运行容器代表已部署实例。看到新提交、拉到新镜像和新容器已就绪，各需要不同的证据。
+
+1. **提交与检查。** 工作分支的本地提交保存在 Git，push 后远端才有。当前工作流监听面向 main 的 PR、main 的 push 和 `v*` tag push。只推送一个还没有 PR 的普通分支，可能看不到这条工作流。先核对触发事件和提交号，再找失败的 step。
+2. **构建与权限。** Builder 先复制 `go.mod`、`go.sum` 下载依赖，再复制源代码；只改业务代码时有机会复用依赖层。最终 Alpine 镜像只从 builder 复制可执行文件，以 UID/GID 10001 运行。Compose 的只读根文件系统、丢弃 capabilities 和禁止提权是运行参数。镜像构建上下文由 `.dockerignore` 筛选，Git 跟踪范围由 `.gitignore` 控制，两套规则要分别检查。
+3. **发布。** 质量、集成和镜像检查通过后，符合条件的 main 或版本标签 push 可以用具备包写权限的工作流发布到 `ghcr.io/im-sage/cloudtask-api`。PR 负责检查。发布成功后，目标主机还需要选择并拉取该镜像，再重建 API 容器。
+4. **部署和回滚。** 在 `.env.docker` 设置已发布的 `IMAGE_TAG`，覆盖文件替换 API 镜像并通过 `!reset` 去掉本地 build。回退时选已验证的旧标签，重复拉取、更新和检查。API 镜像切换后，PostgreSQL 仍使用现有卷，所以回退前要确认旧代码能读取当前表结构。
+
+以下命令用于**已有数据库、Redis 与业务表均已就绪**的环境。先在支持 `!reset` 的 Compose 中检查合并配置选中了哪个镜像。后两步会更新当前 API 实例，适合在准备切换版本时执行。
+
+```powershell
+$dc = @('--env-file', '.env.docker', '-f', 'docker-compose.yml', '-f', 'docker-compose.deploy.yml')
+docker compose @dc config --images
+docker compose @dc pull api
+docker compose @dc up -d --no-deps api
+docker compose @dc ps
+Invoke-RestMethod 'http://127.0.0.1:8080/readyz'
+```
+
+若容器显示 Up 但业务不可用，先看 `ps` 的健康状态、API 日志，再请求一个真实业务接口。`/readyz` 只 Ping PostgreSQL；表没建、缓存异常、某条 SQL 出错都有可能发生在它返回 200 之后。原部署笔记记录了标签、挂载卷和配置解析结果；要判断新部署是否成功，仍应看当前实例的响应。[CI/CD 实验与发布记录](引入CICD.md) · [当前工作流](../../.github/workflows/go-ci.yml) · [部署覆盖](../../docker-compose.deploy.yml)
+
+## 原始材料索引
+
+| 材料 | 适合回查的内容 |
+| --- | --- |
+| [OneNote 导出](../../go_grammer.pdf) | 第 1–3 页为结构体、接口、goroutine、channel、Worker Pool 和错误处理；第 4–5 页为 Compose 与卷；第 6 页为 Gin；第 7–8 页为执行计划和锁 |
+| [按天学习记录](../../daynoete.md) | 归档分支的练习组织方式、3 个 Worker 与超时实验 |
+| [事务](transaction-notes.md) · [乐观锁](optimistic-lock-concurrency-notes.md) | 实验前后如何核对事件、回滚、版本号与 HTTP 响应 |
+| [连接池](pool-bingfa.md) · [并发与锁](concurrency-connections-index-mutex-notes.md) · [执行计划](postgresql-explain-index-notes.md) | 统计快照、跨进程锁的边界和三份实际查询计划 |
+| [Redis](引入redis.md) · [CI/CD](引入CICD.md) | 从第一版缓存到降级、过滤器与回源控制；从配置迁移到镜像、健康检查和 GHCR 发布 |
