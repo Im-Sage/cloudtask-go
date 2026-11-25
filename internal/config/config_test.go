@@ -9,7 +9,7 @@ import (
 // 每次返回一份合法配置
 func validConfig() Config {
 	return Config{
-		Http: HttConfig{
+		HTTP: HTTPConfig{
 			Addr:              ":8080",
 			ReadHeaderTimeout: 5 * time.Second,
 			WriteTimeout:      10 * time.Second,
@@ -131,9 +131,9 @@ func TestValidate(t *testing.T) {
 func prepareLoadEnv(t *testing.T) {
 	t.Helper() // 将函数标记为辅助函数
 
-	// 空目录下不存在 day9/.env。
+	// 空目录下不存在 .env。
 	// Load 当前会忽略“文件不存在”错误。
-	t.Chdir(t.TempDir()) // 在临时目录中运行，避免读到本地day/.env
+	t.Chdir(t.TempDir()) // 在临时目录中运行，避免读到本地 .env
 
 	keys := []string{
 		"HTTP_ADDR",
@@ -204,7 +204,7 @@ func TestLoadValidEnv(t *testing.T) {
 	}
 
 	want := Config{
-		Http: HttConfig{
+		HTTP: HTTPConfig{
 			Addr:              ":9090",
 			ReadHeaderTimeout: 2 * time.Second,
 			WriteTimeout:      12 * time.Second,

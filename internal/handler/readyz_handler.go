@@ -20,11 +20,11 @@ func NewHealthHandler(pool *pgxpool.Pool) *HealthHandler {
 }
 
 func (h *HealthHandler) readySys(c *gin.Context) {
-	ctx, cancle := context.WithTimeout(
+	ctx, cancel := context.WithTimeout(
 		c.Request.Context(),
 		time.Second,
 	)
-	defer cancle()
+	defer cancel()
 
 	if err := h.pool.Ping(ctx); err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{

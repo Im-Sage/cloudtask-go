@@ -59,7 +59,7 @@ func TestConcurrentCacheMiss(t *testing.T) {
 	bloomKey := "cloudtask:task:bloom:build:" + uuid.NewString()
 	log.Printf("本次布隆过滤器 key：%s", bloomKey)
 	taskBloom := cache.NewTaskBloom(rdb, bloomKey)
-	ids, err := taskRepository.GetIds(ctx)
+	ids, err := taskRepository.GetIDs(ctx)
 	if err == nil {
 		err = taskBloom.Build(ctx, ids)
 	}
@@ -150,7 +150,7 @@ func TestRandomTTL(t *testing.T) {
 	bloomKey := "cloudtask:task:bloom:build:" + uuid.NewString()
 	log.Printf("本次布隆过滤器 key：%s", bloomKey)
 	taskBloom := cache.NewTaskBloom(rdb, bloomKey)
-	ids, err := taskRepository.GetIds(ctx)
+	ids, err := taskRepository.GetIDs(ctx)
 	if err == nil {
 		err = taskBloom.Build(ctx, ids)
 	}

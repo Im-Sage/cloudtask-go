@@ -25,10 +25,10 @@ func NewDBPool(ctx context.Context, cfg config.PostgresConfig) (*pgxpool.Pool, e
 		return nil, fmt.Errorf("创建数据库连接池失败: %w", err)
 	}
 
-	pingCtx, cancle := context.WithTimeout(
+	pingCtx, cancel := context.WithTimeout(
 		ctx, cfg.PingTimeout,
 	)
-	defer cancle()
+	defer cancel()
 
 	if err := pool.Ping(pingCtx); err != nil {
 		defer pool.Close()                                         // Ping失败时关闭连接池

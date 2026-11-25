@@ -7,7 +7,7 @@ import (
 	"golang.org/x/time/rate"
 )
 
-func TestTokenBu(t *testing.T) {
+func TestTokenBucket(t *testing.T) {
 	now := time.Now()
 	// 长期放行速率约为每秒 10 个，但最多积累 3 个令牌用于突发。
 	limiter := rate.NewLimiter(rate.Limit(10), 3) // 每100ms补充一个令牌

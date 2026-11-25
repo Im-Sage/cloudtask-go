@@ -25,7 +25,7 @@ func NewTaskRepository(pool *pgxpool.Pool) *TaskRepository {
 }
 
 var ErrTaskNotFound = errors.New("task not found")
-var ErrVersionConflict = errors.New("task version conflct")
+var ErrVersionConflict = errors.New("task version conflict")
 var ErrRateLimited = errors.New("请求过于频繁，请稍后重试")
 
 // 创建任务
@@ -159,11 +159,11 @@ func (r *TaskRepository) UpdateTask(
 	}
 	// 回滚兜底
 	defer func() {
-		rollbackCtx, cancle := context.WithTimeout(
+		rollbackCtx, cancel := context.WithTimeout(
 			context.Background(),
 			3*time.Second,
 		)
-		defer cancle()
+		defer cancel()
 		_ = tx.Rollback(rollbackCtx)
 	}()
 
@@ -205,10 +205,10 @@ func (r *TaskRepository) UpdateTask(
 	}
 
 	// 同时向task_events表内插入数据，事件类型为task_updated
-	event_type := "task_updated"
+	eventType := "task_updated"
 	tag, err := tx.Exec(ctx,
 		`Insert into task_events (task_id, event_type) values($1, $2)`,
-		id, event_type)
+		id, eventType)
 	if err != nil {
 		return model.Task{}, err
 	}
@@ -241,7 +241,7 @@ func (r *TaskRepository) DeleteTask(
 }
 
 // 数据量不大的情况下，获取所有的id，为布隆过滤器做准备
-func (r *TaskRepository) GetIds(ctx context.Context) ([]int64, error) {
+func (r *TaskRepository) GetIDs(ctx context.Context) ([]int64, error) {
 	var ids []int64
 
 	rows, err := r.pool.Query(
@@ -261,6 +261,9 @@ func (r *TaskRepository) GetIds(ctx context.Context) ([]int64, error) {
 			return ids, err
 		}
 		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历任务 ID 失败：%w", err)
 	}
 	return ids, nil
 }
@@ -319,7 +322,7 @@ func (r *TaskRepository) ChangeStatus(
 	// 使用tx.Exec 插入 task_event;
 	// var task_event model.TaskEvent
 	// task_event.TaskID = id
-	event_type := "status_changed"
+	eventType := "status_changed"
 	details, err := json.Marshal(map[string]string{
 		"old_status": oldStatus,
 		"new_status": newStatus,
@@ -331,7 +334,7 @@ func (r *TaskRepository) ChangeStatus(
 	tag, err = tx.Exec(
 		ctx,
 		`insert into task_events (task_id, event_type, details) values ($1,$2,$3)`,
-		id, event_type, details,
+		id, eventType, details,
 	)
 	if err != nil {
 		return fmt.Errorf("插入事件失败：%w", err)
@@ -342,7 +345,7 @@ func (r *TaskRepository) ChangeStatus(
 	return tx.Commit(ctx)
 }
 
-func (r *TaskRepository) ChangeStatusOptimistis(
+func (r *TaskRepository) ChangeStatusOptimistic(
 	ctx context.Context,
 	id int64,
 	newStatus string,
@@ -363,8 +366,8 @@ func (r *TaskRepository) ChangeStatusOptimistis(
 	}()
 
 	// 读取当前任务和版本号
-	var old_status string
-	var old_version int64
+	var oldStatus string
+	var oldVersion int64
 	var task model.Task
 
 	err = tx.QueryRow(
@@ -372,8 +375,8 @@ func (r *TaskRepository) ChangeStatusOptimistis(
 		`SELECT status, version from tasks where id = $1`,
 		id,
 	).Scan(
-		&old_status,
-		&old_version,
+		&oldStatus,
+		&oldVersion,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return model.Task{}, fmt.Errorf("任务 %d: %w", id, ErrTaskNotFound)
@@ -382,8 +385,8 @@ func (r *TaskRepository) ChangeStatusOptimistis(
 		return model.Task{}, err
 	}
 
-	// 判断期待的版本号是否和oldversion一样
-	if old_version != expectedVersion {
+	// 判断期待的版本号是否和oldVersion一样
+	if oldVersion != expectedVersion {
 		return model.Task{}, fmt.Errorf("任务%d更新状态失败：%w", id, ErrVersionConflict)
 	} else {
 		// 一致则更新表中数据
@@ -415,9 +418,9 @@ func (r *TaskRepository) ChangeStatusOptimistis(
 			return model.Task{}, err
 		}
 		// 同时向事件表中插入数据
-		event_type := "status_changed"
+		eventType := "status_changed"
 		details, err := json.Marshal(map[string]string{
-			"old_status": old_status,
+			"old_status": oldStatus,
 			"new_status": newStatus,
 		})
 		if err != nil {
@@ -426,7 +429,7 @@ func (r *TaskRepository) ChangeStatusOptimistis(
 		tag, err := tx.Exec(
 			ctx,
 			`insert into task_events (task_id, event_type, details) values ($1,$2,$3)`,
-			id, event_type, details,
+			id, eventType, details,
 		)
 		if err != nil {
 			return model.Task{}, fmt.Errorf("插入事件失败：%w", err)

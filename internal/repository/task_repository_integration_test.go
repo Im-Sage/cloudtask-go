@@ -252,13 +252,13 @@ func TestChangeStatusOptimisticConflict(t *testing.T) {
 		}
 	})
 	// 此时before中的version字段为1
-	// 先调用ChangeStatusOptimistis成功更新一次，version+1 = 2
-	task1, err := repo.ChangeStatusOptimistis(ctx, before.ID, "in_progress", before.Version)
+	// 先调用ChangeStatusOptimistic成功更新一次，version+1 = 2
+	task1, err := repo.ChangeStatusOptimistic(ctx, before.ID, "in_progress", before.Version)
 	if err != nil {
 		t.Fatalf("改变任务状态失败：%v", err)
 	}
 	// 再调用一次，version正确因为2
-	after, err := repo.ChangeStatusOptimistis(ctx, before.ID, "completed", before.Version) // before.Version仍为1
+	after, err := repo.ChangeStatusOptimistic(ctx, before.ID, "completed", before.Version) // before.Version仍为1
 
 	if !errors.Is(err, ErrVersionConflict) {
 		t.Fatalf("预期返回版本冲突错误，实际为：%v", err)
