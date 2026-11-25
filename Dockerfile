@@ -23,8 +23,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/cloudta
 FROM alpine:3.23 AS runtime
 
 # 如需验证HTTPS或数据库TLS证书，安装CA证书和url，安装软件需要root权限
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories && \
-    apk add --no-cache ca-certificates curl
+RUN apk add --no-cache ca-certificates curl
 
 
 # 创建 app 用户组和用户
