@@ -161,12 +161,12 @@ expected_version 由于复用请求结构，绑定要求为正整数；**业务�
 }
 ```
 
-旧版本：409，错误码包含空格，以下按当前实现保留：
+旧版本：409：
 
 ```json
 {
   "error": {
-    "code": "TASK VERSION CONFLICT",
+    "code": "TASK_VERSION_CONFLICT",
     "message": "任务状态冲突"
   }
 }

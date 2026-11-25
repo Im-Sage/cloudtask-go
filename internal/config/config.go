@@ -11,14 +11,14 @@ import (
 )
 
 type Config struct {
-	Http     HttConfig
+	HTTP     HTTPConfig
 	Postgres PostgresConfig
 	Redis    RedisConfig
 
 	StartupTimeout time.Duration
 }
 
-type HttConfig struct {
+type HTTPConfig struct {
 	Addr              string
 	ReadHeaderTimeout time.Duration
 	WriteTimeout      time.Duration
@@ -68,7 +68,7 @@ func Load() (Config, error) {
 		}
 	}
 
-	var httpStru HttConfig
+	var httpStru HTTPConfig
 	httpStru.Addr = envOrDefault("HTTP_ADDR", ":8080")
 	readHeaderTimeout, err := durationFromEnv("HTTP_READ_HEADER_TIMEOUT", "5s")
 	if err != nil {
@@ -132,7 +132,7 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	var cfg = Config{
-		Http:           httpStru,
+		HTTP:           httpStru,
 		Postgres:       postgresStru,
 		Redis:          redisStru,
 		StartupTimeout: startupTimeout,

@@ -28,7 +28,7 @@ flowchart TD
 | internal/repository | 数据访问、版本检测和事件事务 |
 | internal/database | 创建连接池并 Ping |
 | internal/model | Task、TaskEvent 数据结构 |
-| internal/requestbody | JSON 标签和绑定校验 |
+| internal/dto | JSON 标签和绑定校验 |
 | cmd/optimistic-demo | 向服务发送并发请求的独立客户端 |
 | internal/config | 独立连接池实验，不是环境配置加载器 |
 

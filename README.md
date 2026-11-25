@@ -83,7 +83,7 @@ docker compose --env-file .env.docker exec db psql -U app -d cloudtask -c "SELEC
 | `PATCH /tasks/:id` | 加行锁后修改状态；请求体要求正数 `expected_version`，此入口只校验其格式 |
 | `PATCH /tasks/opm/:id` | 按客户端版本条件更新；成功返回 `data.version`，版本冲突返回 409 |
 
-支持的状态为 `pending`、`in_progress` 和 `completed`。当前 HTTP 路由没有鉴权，事件通过 SQL 查询。字段与错误映射可对照 [请求结构](internal/requestbody/task_request.go) 和 [Handler](internal/handler/task_handler.go)。
+支持的状态为 `pending`、`in_progress` 和 `completed`。当前 HTTP 路由没有鉴权，事件通过 SQL 查询。字段与错误映射可对照 [请求结构](internal/dto/task_request.go) 和 [Handler](internal/handler/task_handler.go)。
 
 ## 构建与测试
 

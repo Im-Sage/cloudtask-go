@@ -8,8 +8,8 @@ import (
 	"slices"
 	"strconv"
 
+	"github.com/Im-Sage/cloudtask-go/internal/dto"
 	"github.com/Im-Sage/cloudtask-go/internal/repository"
-	"github.com/Im-Sage/cloudtask-go/internal/requestbody"
 	"github.com/Im-Sage/cloudtask-go/internal/service"
 	"github.com/gin-gonic/gin"
 )
@@ -109,7 +109,7 @@ func (h *TaskHandler) GetAllTasks(
 func (h *TaskHandler) CreateTask(
 	c *gin.Context,
 ) {
-	var req requestbody.CreateTaskRequest
+	var req dto.CreateTaskRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeError(c, http.StatusBadRequest, "INVALID_REQUEST", "创建内容无效")
 		return
@@ -180,7 +180,7 @@ func (h *TaskHandler) UpdateTask(
 	c *gin.Context,
 ) {
 	// 要更新的内容在c中，把要更新的内容放在req中
-	var req requestbody.UpdateTaskRequest
+	var req dto.UpdateTaskRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeError(c, http.StatusBadRequest, "INVALID_REQUEST", "更新内容无效")
 		return
@@ -231,7 +231,7 @@ func (h *TaskHandler) UpdateTask(
 	// }
 }
 
-func (s *TaskHandler) ChangeStatus(c *gin.Context) {
+func (h *TaskHandler) ChangeStatus(c *gin.Context) {
 	// 接收路径参数
 	idStr := c.Param("id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
@@ -240,14 +240,14 @@ func (s *TaskHandler) ChangeStatus(c *gin.Context) {
 		return
 	}
 	// 获取status
-	var req requestbody.ChangeStatusRequest
+	var req dto.ChangeStatusRequest
 
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeError(c, http.StatusBadRequest, "INVALID_REQUEST", "请求参数有问题")
 		return
 	}
 	newStatus := req.Status
-	err = s.taskService.ChangeStatus(c.Request.Context(), id, newStatus)
+	err = h.taskService.ChangeStatus(c.Request.Context(), id, newStatus)
 
 	if errors.Is(err, service.ErrInvalidStatus) {
 		writeError(c, http.StatusBadRequest, "INVALID_STATUS", "无效的状态值")
@@ -268,7 +268,7 @@ func (s *TaskHandler) ChangeStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "更新成功"})
 }
 
-func (s *TaskHandler) ChangeStatusOptimistis(c *gin.Context) {
+func (h *TaskHandler) ChangeStatusOptimistic(c *gin.Context) {
 	// 接收路径参数
 	idStr := c.Param("id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
@@ -277,7 +277,7 @@ func (s *TaskHandler) ChangeStatusOptimistis(c *gin.Context) {
 		return
 	}
 	// 获取status
-	var req requestbody.ChangeStatusRequest
+	var req dto.ChangeStatusRequest
 
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeError(c, http.StatusBadRequest, "INVALID_REQUEST", "请求参数有问题")
@@ -285,14 +285,14 @@ func (s *TaskHandler) ChangeStatusOptimistis(c *gin.Context) {
 	}
 	newStatus := req.Status
 	expectedVersion := req.ExpectedVersion
-	task, err := s.taskService.ChangeStatusOptimistis(
+	task, err := h.taskService.ChangeStatusOptimistic(
 		c.Request.Context(),
 		id, newStatus,
 		expectedVersion,
 	)
 
 	if errors.Is(err, repository.ErrVersionConflict) {
-		writeError(c, http.StatusConflict, "TASK VERSION CONFLICT", "任务状态冲突")
+		writeError(c, http.StatusConflict, "TASK_VERSION_CONFLICT", "任务状态冲突")
 		return
 	}
 

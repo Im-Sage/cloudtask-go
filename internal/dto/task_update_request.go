@@ -1,4 +1,4 @@
-package requestbody
+package dto
 
 type UpdateTaskRequest struct {
 	Title  string `json:"title" binding:"required,max=200"`

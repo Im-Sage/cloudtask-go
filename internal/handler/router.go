@@ -14,7 +14,7 @@ func NewRouter(taskService *service.TaskService, pool *pgxpool.Pool) *gin.Engine
 
 	healthHandler := NewHealthHandler(pool)
 
-	router.GET("/healthz", taskHandler.healthzSys)
+	router.GET("/healthz", healthHandler.healthzSys)
 
 	router.GET("/readyz", healthHandler.readySys)
 
@@ -32,7 +32,7 @@ func NewRouter(taskService *service.TaskService, pool *pgxpool.Pool) *gin.Engine
 
 	router.PATCH("/tasks/:id", taskHandler.ChangeStatus)
 
-	router.PATCH("tasks/opm/:id", taskHandler.ChangeStatusOptimistis)
+	router.PATCH("/tasks/opm/:id", taskHandler.ChangeStatusOptimistic)
 
 	// router.GET("/tasks?limit=3&offset=0", taskHandler)
 

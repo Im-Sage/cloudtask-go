@@ -59,7 +59,7 @@ func TestRedisStop(t *testing.T) {
 	bloomKey := "cloudtask:task:bloom:build:" + uuid.NewString()
 	log.Printf("本次布隆过滤器 key：%s", bloomKey)
 	taskBloom := cache.NewTaskBloom(rdb, bloomKey)
-	ids, err := taskRepository.GetIds(initCtx)
+	ids, err := taskRepository.GetIDs(initCtx)
 	if err == nil {
 		err = taskBloom.Build(initCtx, ids)
 	}
