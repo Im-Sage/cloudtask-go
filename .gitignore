@@ -1,0 +1,15 @@
+/db/backups/cloudtask-before-baseline.dump
+
+
+# 本地编译产物
+*.exe
+
+# 环境配置，仅保留示例
+.env
+.env.*
+!.env.example
+!.env.docker.example
+
+# 暂时排除
+.md
+.pdf
